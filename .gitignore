@@ -150,6 +150,9 @@ dist
 
 .vscode-test
 
+# vscode
+.vscode/
+
 # yarn v2
 
 .yarn/cache
@@ -165,3 +168,5 @@ dist
 .env*
 !.env.example
 .wrangler/
+
+
