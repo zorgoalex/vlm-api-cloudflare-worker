@@ -3,6 +3,16 @@
 // Runtime types generated with workerd@1.20250816.0 2025-08-23 
 declare namespace Cloudflare {
 	interface Env {
+      // === BEGIN custom bindings ===
+      OPENROUTER_API_KEY?: string;  // опционально, если используешь OpenRouter
+      BIGMODEL_API_KEY: string;     // секрет BigModel (wrangler secret put BIGMODEL_API_KEY)
+
+      // не-секреты
+      DEFAULT_MODEL?: string;       // например, "glm-4.5v"
+      ALLOWED_ORIGINS?: string;     // "https://front.app,http://localhost:3000"
+      APP_URL?: string;             // (для OpenRouter) Referer
+      APP_TITLE?: string;           // (для OpenRouter) X-Title
+      // === END custom bindings ===
 	}
 }
 interface Env extends Cloudflare.Env {}

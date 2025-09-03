@@ -1,53 +1,37 @@
 /**
- * VLMM proxy on Cloudflare Workers
+ * VLMM proxy on Cloudflare Workers — OpenRouter + BigModel (GLM-4.5V)
  *  - POST /v1/vision/analyze  (JSON or multipart/form-data)
  *  - POST /v1/vision/stream   (SSE passthrough)
  *  - GET  /healthz
  *
- * CORS:
- *  - Разрешённые Origin'ы берутся из env.ALLOWED_ORIGINS (через запятую)
- *    или из DEFAULT_ALLOWED_ORIGINS ниже.
+ * Changes in this version:
+ *  - Added provider "bigmodel" with model "glm-4.5v" via https://open.bigmodel.cn/api/paas/v4/chat/completions
+ *  - Unified payload builder for vision (text + image_url / data URL)
+ *  - Provider switch: body.provider | URL ?provider= | default → "bigmodel"
  */
 
 export interface Env {
-  OPENROUTER_API_KEY: string; // wrangler secret put OPENROUTER_API_KEY
-  DEFAULT_MODEL?: string;     // wrangler vars (не секрет)
-  APP_URL?: string;           // для HTTP-Referer атрибуции
-  APP_TITLE?: string;         // для X-Title атрибуции
-  ALLOWED_ORIGINS?: string;   // "https://front.vercel.app,http://localhost:3000"
+  OPENROUTER_API_KEY?: string;  // optional if you use only BigModel
+  BIGMODEL_API_KEY: string;      // wrangler secret put BIGMODEL_API_KEY
+  DEFAULT_MODEL?: string;        // e.g. "glm-4.5v" (BigModel) or any OpenRouter model
+  ALLOWED_ORIGINS?: string;      // comma-separated list
+  APP_URL?: string;              // (OpenRouter attribution) Referer
+  APP_TITLE?: string;            // (OpenRouter attribution) X-Title
 }
 
-// ← поставь свой домен фронта (можно добавить ещё)
+// ---- Utilities -------------------------------------------------------------
+
 const DEFAULT_ALLOWED_ORIGINS = [
   "http://localhost:3000",
-  "https://vlm-api-front.vercel.app",
+  "http://localhost:5173",
+  "http://127.0.0.1:3000",
 ];
 
-const MAX_FILE_MB = 1;
-const ALLOWED_MIME = /^image\/(jpeg|png|webp|gif)$/i;
-
-type Detail = "low" | "high" | "auto";
-
-type AnalyzeJsonBody = {
-  prompt?: string;
-  image_url?: string;
-  image_base64?: string; // без data:-префикса
-  model?: string;
-  detail?: Detail;
-  stream?: boolean;
-};
-
-function parseAllowedOrigins(env: Env): Set<string> {
-  const fromEnv = (env.ALLOWED_ORIGINS || "")
-    .split(",")
-    .map(s => s.trim())
-    .filter(Boolean);
-  return new Set(fromEnv.length ? fromEnv : DEFAULT_ALLOWED_ORIGINS);
-}
-
 function corsHeadersFor(req: Request, env: Env, extra: Record<string, string> = {}) {
-  const allowed = parseAllowedOrigins(env);
   const origin = req.headers.get("Origin") || "";
+  const allowed = new Set<string>(
+    (env.ALLOWED_ORIGINS ? env.ALLOWED_ORIGINS.split(/,\s*/) : DEFAULT_ALLOWED_ORIGINS)
+  );
   const headers: Record<string, string> = {
     "Vary": "Origin",
     "Access-Control-Allow-Methods": "POST, OPTIONS",
@@ -61,175 +45,195 @@ function corsHeadersFor(req: Request, env: Env, extra: Record<string, string> = 
   return headers;
 }
 
-function jsonResponse(req: Request, env: Env, body: any, status = 200) {
+function jsonResponse(req: Request, env: Env, body: unknown, status = 200) {
   return new Response(JSON.stringify(body), {
     status,
-    headers: { "content-type": "application/json", ...corsHeadersFor(req, env) },
+    headers: { "content-type": "application/json; charset=utf-8", ...corsHeadersFor(req, env) },
   });
 }
 
-async function fileToDataUrl(file: File): Promise<string> {
-  if (!ALLOWED_MIME.test(file.type)) {
-    throw new Error("Unsupported file type (jpeg/png/webp/gif only).");
-  }
-  if (file.size > MAX_FILE_MB * 1024 * 1024) {
-    throw new Error(`File too large (> ${MAX_FILE_MB}MB).`);
-  }
-  const buf = await file.arrayBuffer();
-  // конвертируем буфер в base64 без переполнения call stack
-  let binary = "";
-  const bytes = new Uint8Array(buf);
-  const chunk = 0x8000;
-  for (let i = 0; i < bytes.length; i += chunk) {
-    binary += String.fromCharCode(...bytes.subarray(i, i + chunk));
-  }
-  const b64 = btoa(binary);
+async function fileToDataURL(file: File): Promise<{url: string; mime: string}> {
   const mime = file.type || "image/jpeg";
-  return `data:${mime};base64,${b64}`;
+  const buf = new Uint8Array(await file.arrayBuffer());
+  let binary = "";
+  for (let i = 0; i < buf.length; i++) binary += String.fromCharCode(buf[i]);
+  const b64 = btoa(binary);
+  return { url: `data:${mime};base64,${b64}` , mime };
 }
 
-function makeMessages(prompt: string, imageUrlData: string, detail?: Detail) {
-  const content: any[] = [{ type: "text", text: prompt }];
-  if (detail) content.push({ type: "image_url", image_url: { url: imageUrlData, detail } });
-  else content.push({ type: "image_url", image_url: { url: imageUrlData } });
-  return [{ role: "user", content }];
+function getQueryFlag(url: URL, name: string): boolean | undefined {
+  const v = url.searchParams.get(name);
+  if (v === null) return undefined;
+  if (v === "1" || v === "true" || v === "yes") return true;
+  if (v === "0" || v === "false" || v === "no") return false;
+  return undefined;
 }
 
-async function buildContentFromRequest(req: Request): Promise<{
-  prompt: string;
-  imageUrlData: string;
-  detail?: Detail;
+// ---- Input parsing ---------------------------------------------------------
+
+type AnalyzeInput = {
+  provider?: "bigmodel" | "openrouter";
   model?: string;
-  stream: boolean;
-}> {
+  prompt?: string;
+  image_url?: string;           // http(s) or data URL
+  image_base64?: string;        // raw base64 without data: prefix
+  detail?: "low" | "high" | "auto";
+  stream?: boolean;
+  thinking?: "enabled" | "disabled"; // BigModel-specific switch
+  images?: string[];            // optional multiple images (urls or data URLs)
+};
+
+async function parseAnalyzePayload(req: Request): Promise<AnalyzeInput> {
   const ct = req.headers.get("content-type") || "";
   if (ct.includes("multipart/form-data")) {
     const form = await req.formData();
-    const prompt = (form.get("prompt") as string) || "Describe the image in detail.";
-    const model = (form.get("model") as string) || undefined;
-    const detail = (form.get("detail") as Detail) || undefined;
-    const stream = (form.get("stream") as string) === "true";
-
     const file = form.get("file");
-    const urlField = form.get("image_url") as string | null;
+    const prompt = (form.get("prompt") || "") as string;
+    const model = (form.get("model") || "") as string;
+    const provider = (form.get("provider") || "") as string;
+    const detail = (form.get("detail") || "auto") as AnalyzeInput["detail"];
+    const thinking = (form.get("thinking") || "") as AnalyzeInput["thinking"];
 
-    if (file instanceof File) {
-      const dataUrl = await fileToDataUrl(file);
-      return { prompt, imageUrlData: dataUrl, detail, model, stream };
+    let image_url = (form.get("image_url") || "") as string;
+    let image_base64 = (form.get("image_base64") || "") as string;
+
+    if (!image_url && !image_base64 && file instanceof File) {
+      const { url } = await fileToDataURL(file);
+      image_url = url;
     }
-    if (urlField) {
-      return { prompt, imageUrlData: urlField, detail, model, stream };
-    }
-    throw new Error("Expected 'file' in multipart/form-data (or provide 'image_url').");
+
+    return { provider: provider as any, model, prompt, image_url, image_base64, detail, thinking };
   }
 
-  const body = (await req.json()) as AnalyzeJsonBody;
-  const prompt = body.prompt || "Describe the image in detail.";
-  const model = body.model;
-  const detail = body.detail;
-  const stream = !!body.stream;
-
-  if (body.image_url) {
-    return { prompt, imageUrlData: body.image_url, detail, model, stream };
-  }
-  if (body.image_base64) {
-    return {
-      prompt,
-      imageUrlData: `data:image/jpeg;base64,${body.image_base64}`,
-      detail,
-      model,
-      stream,
-    };
-  }
-  throw new Error("Provide either 'image_url' or 'image_base64' or use multipart with 'file'.");
+  // JSON
+  const body = (await req.json().catch(() => ({}))) as AnalyzeInput;
+  return body;
 }
 
-async function callOpenRouter(env: Env, payload: any) {
+// Build OpenAI-style multi-modal message for both providers
+function buildMessages(input: AnalyzeInput) {
+  const content: any[] = [];
+
+  const pushImage = (url: string) => {
+    if (!url) return;
+    content.push({ type: "image_url", image_url: { url, ...(input.detail ? { detail: input.detail } : {}) } });
+  };
+
+  if (Array.isArray(input.images) && input.images.length) {
+    input.images.forEach(pushImage);
+  } else {
+    if (input.image_url) pushImage(input.image_url);
+    else if (input.image_base64) pushImage(`data:image/jpeg;base64,${input.image_base64}`);
+  }
+
+  if (input.prompt && input.prompt.trim()) {
+    content.push({ type: "text", text: input.prompt });
+  }
+
+  // If no content, enforce at least a default text
+  if (!content.length) content.push({ type: "text", text: "Describe the image briefly." });
+
+  return [{ role: "user", content }];
+}
+
+// ---- Providers -------------------------------------------------------------
+
+async function callBigModel(env: Env, payload: any, stream = false) {
+  const url = new URL("https://open.bigmodel.cn/api/paas/v4/chat/completions");
   const headers: Record<string, string> = {
-    "Authorization": `Bearer ${env.OPENROUTER_API_KEY}`,
+    Authorization: `Bearer ${env.BIGMODEL_API_KEY}`,
+    "Content-Type": "application/json",
+  };
+  const init: RequestInit = {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ ...payload, stream }),
+  };
+  return fetch(url.toString(), init);
+}
+
+async function callOpenRouter(env: Env, payload: any, stream = false) {
+  if (!env.OPENROUTER_API_KEY) throw new Error("OPENROUTER_API_KEY is not set");
+  const url = new URL("https://openrouter.ai/api/v1/chat/completions");
+  const headers: Record<string, string> = {
+    Authorization: `Bearer ${env.OPENROUTER_API_KEY}`,
     "Content-Type": "application/json",
   };
   if (env.APP_URL) headers["HTTP-Referer"] = env.APP_URL;
   if (env.APP_TITLE) headers["X-Title"] = env.APP_TITLE;
 
-  return fetch("https://openrouter.ai/api/v1/chat/completions", {
+  const init: RequestInit = {
     method: "POST",
     headers,
-    body: JSON.stringify(payload),
-  });
+    body: JSON.stringify({ ...payload, stream }),
+  };
+  return fetch(url.toString(), init);
 }
 
+function providerFrom(input: AnalyzeInput, url: URL): "bigmodel" | "openrouter" {
+  const p = input.provider || (url.searchParams.get("provider") as any);
+  return p === "openrouter" ? "openrouter" : "bigmodel"; // default BigModel
+}
+
+function modelFrom(input: AnalyzeInput, env: Env, provider: string): string {
+  if (input.model && input.model.trim()) return input.model;
+  if (env.DEFAULT_MODEL && env.DEFAULT_MODEL.trim()) return env.DEFAULT_MODEL;
+  return provider === "openrouter" ? "qwen/qwen2.5-vl-72b-instruct" : "glm-4.5v";
+}
+
+// ---- Worker routes ---------------------------------------------------------
+
 export default {
-  async fetch(req: Request, env: Env): Promise<Response> {
+  async fetch(req: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(req.url);
-    const reqId = crypto.randomUUID();
 
     // CORS preflight
     if (req.method === "OPTIONS") {
-      return new Response(null, { status: 204, headers: corsHeadersFor(req, env) });
+      return new Response(null, { headers: corsHeadersFor(req, env) });
     }
 
-    // Health
     if (url.pathname === "/healthz") {
-      return jsonResponse(req, env, { ok: true, request_id: reqId });
+      return new Response("ok", { headers: corsHeadersFor(req, env) });
     }
 
-    // /v1/vision/analyze
-    if (url.pathname === "/v1/vision/analyze" && req.method === "POST") {
+    if ((url.pathname === "/v1/vision/analyze" || url.pathname === "/v1/vision/stream") && req.method === "POST") {
       try {
-        const { prompt, imageUrlData, detail, model } = await buildContentFromRequest(req);
-        const payload = {
-          model: model || env.DEFAULT_MODEL || "openai/gpt-4o-mini",
-          messages: makeMessages(prompt, imageUrlData, detail),
-          stream: false,
-        };
+        const input = await parseAnalyzePayload(req);
+        const provider = providerFrom(input, url);
+        const model = modelFrom(input, env, provider);
+        const stream = url.pathname.endsWith("/stream") || !!input.stream || getQueryFlag(url, "stream") === true;
 
-        const upstream = await callOpenRouter(env, payload);
-        const text = await upstream.text();
+        const messages = buildMessages(input);
+        const payload: any = { model, messages };
 
-        return new Response(text, {
-          status: upstream.status,
-          headers: { "content-type": "application/json", ...corsHeadersFor(req, env), "x-request-id": reqId },
-        });
+        // BigModel-specific: thinking switch
+        if (provider === "bigmodel") {
+          if (input.thinking === "enabled") payload.thinking = { type: "enabled" };
+          if (input.thinking === "disabled") payload.thinking = { type: "disabled" };
+        }
+
+        const upstream = provider === "openrouter"
+          ? await callOpenRouter(env, payload, stream)
+          : await callBigModel(env, payload, stream);
+
+        if (stream) {
+          // SSE passthrough
+          // Ensure CORS + proper content-type
+          const headers = new Headers(upstream.headers);
+          headers.set("content-type", "text/event-stream; charset=utf-8");
+          for (const [k, v] of Object.entries(corsHeadersFor(req, env))) headers.set(k, v);
+          return new Response(upstream.body, { status: upstream.status, headers });
+        }
+
+        // Non-stream JSON
+        const data = await upstream.json();
+        const headers = corsHeadersFor(req, env);
+        return new Response(JSON.stringify(data), { status: upstream.status, headers: { "content-type": "application/json", ...headers } });
       } catch (e: any) {
-        console.error("[analyze]", reqId, e);
-        return jsonResponse(req, env, { request_id: reqId, error: e.message || "Bad Request" }, 400);
+        return jsonResponse(req, env, { error: e?.message || "Bad Request" }, 400);
       }
     }
 
-    // /v1/vision/stream
-    if (url.pathname === "/v1/vision/stream" && req.method === "POST") {
-      try {
-        const { prompt, imageUrlData, detail, model } = await buildContentFromRequest(req);
-        const payload = {
-          model: model || env.DEFAULT_MODEL || "openai/gpt-4o-mini",
-          messages: makeMessages(prompt, imageUrlData, detail),
-          stream: true,
-        };
-
-        const upstream = await callOpenRouter(env, payload);
-        const headers = new Headers({
-          "content-type": "text/event-stream; charset=utf-8",
-          "cache-control": "no-cache",
-          "connection": "keep-alive",
-          "x-request-id": reqId,
-          ...corsHeadersFor(req, env),
-        });
-
-        return new Response(upstream.body, {
-          status: upstream.status,
-          headers,
-        });
-      } catch (e: any) {
-        console.error("[stream]", reqId, e);
-        const errLine = `data: ${JSON.stringify({ request_id: reqId, error: e.message || "Bad Request" })}\n\n`;
-        return new Response(errLine, {
-          status: 400,
-          headers: { "content-type": "text/event-stream; charset=utf-8", ...corsHeadersFor(req, env), "x-request-id": reqId },
-        });
-      }
-    }
-
-    return jsonResponse(req, env, { request_id: reqId, error: "Not Found" }, 404);
+    return jsonResponse(req, env, { error: "Not Found" }, 404);
   },
 };

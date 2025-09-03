@@ -271,3 +271,101 @@ curl -N -X POST "https://<worker>/v1/vision/stream" \
 * ✔ Фронт собирается локально и на Vercel, умеет отправлять картинки и показывать ответы.
 
 Готово — можно использовать как лёгкий «шлюз» к любым VLMM в OpenRouter и развивать дальше.
+
+
+# BigModel (GLM-4.5V) added to VLMM Worker
+
+This revision wires **BigModel** into the existing Cloudflare Worker so you can call `glm-4.5v` for vision.
+
+## 1) Configure
+
+```bash
+# secrets (never commit)
+wrangler secret put BIGMODEL_API_KEY
+# optional, keep if you still use OpenRouter
+wrangler secret put OPENROUTER_API_KEY
+
+# env vars in wrangler.jsonc are already set:
+#   DEFAULT_MODEL = glm-4.5v
+#   ALLOWED_ORIGINS, APP_URL, APP_TITLE
+```
+
+Deploy:
+
+```bash
+wrangler deploy
+```
+
+## 2) Endpoints (unchanged)
+
+* `POST /v1/vision/analyze` — JSON response
+* `POST /v1/vision/stream`  — SSE passthrough
+* `GET  /healthz`
+
+### Accepted input
+
+Either **JSON** or **multipart/form-data** with fields:
+
+* `provider`: `bigmodel` | `openrouter` (default: `bigmodel`)
+* `model`: override model (defaults to `glm-4.5v` for BigModel)
+* `prompt`: user text
+* `image_url`: http(s) **or** `data:*;base64,...`
+* `image_base64`: raw base64 (we'll wrap into `data:image/jpeg;base64,`)
+* `images`: array of URLs/data-URLs (optional, multi-image)
+* `detail`: `low` | `high` | `auto` (mapped to `image_url.detail`)
+* `thinking`: `enabled` | `disabled` (BigModel-only)
+* `stream`: boolean (or use `/stream` path)
+
+## 3) Insomnia cURL examples
+
+### A) Non-stream JSON (BigModel, single image URL)
+
+```bash
+curl -X POST "$WORKER_URL/v1/vision/analyze" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "provider": "bigmodel",
+    "model": "glm-4.5v",
+    "prompt": "List the objects you see and their rough positions",
+    "image_url": "https://cdn.bigmodel.cn/static/logo/register.png",
+    "thinking": "enabled"
+  }'
+```
+
+### B) Stream (SSE) — BigModel
+
+```bash
+curl -N -X POST "$WORKER_URL/v1/vision/stream" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "provider": "bigmodel",
+    "model": "glm-4.5v",
+    "prompt": "Explain the flowchart",
+    "image_url": "https://cdn.bigmodel.cn/static/logo/api-key.png",
+    "thinking": "enabled",
+    "stream": true
+  }'
+```
+
+### C) Multipart (local file upload)
+
+```bash
+curl -X POST "$WORKER_URL/v1/vision/analyze" \
+  -H "Content-Type: multipart/form-data" \
+  -F "file=@/path/to/image.jpg" \
+  -F "prompt=Summarize the chart" \
+  -F "provider=bigmodel" \
+  -F "model=glm-4.5v" \
+  -F "detail=high" \
+  -F "thinking=enabled"
+```
+
+> Multi-image: use JSON and provide `images: ["url1", "url2", ...]`.
+
+## 4) Notes
+
+* Endpoint and message format follow BigModel docs: `POST https://open.bigmodel.cn/api/paas/v4/chat/completions` with `messages[0].content = [{type: "image_url", image_url:{url}}, {type:"text", text}]`. Stream mode sets `stream: true`. Thinking mode is `{ thinking: { type: "enabled" } }`.
+* For OpenRouter nothing changed; just set `provider=openrouter` and pass any OpenRouter vision model.
+* CORS: allowed origins are controlled by `ALLOWED_ORIGINS`.
+* If you receive 401 from the worker, ensure the `BIGMODEL_API_KEY` secret is present in your Worker env and not expired.
+

@@ -2,6 +2,9 @@
  * For more details on how to configure Wrangler, refer to:
  * https://developers.cloudflare.com/workers/wrangler/configuration/
  */
+ /**
+"DEFAULT_MODEL": "qwen/qwen2.5-vl-72b-instruct",
+ */
 {
 	"$schema": "node_modules/wrangler/config-schema.json",
 	"name": "vlmm-worker",
@@ -12,7 +15,7 @@
 	},
 	"vars": {
 		"ALLOWED_ORIGINS": "https://vlm-api-front.vercel.app,http://localhost:3000",
-		"DEFAULT_MODEL": "qwen/qwen2.5-vl-72b-instruct",
+		"DEFAULT_MODEL": "glm-4.5v",
     	"APP_URL": "vlm-api-front.vercel.app",
     	"APP_TITLE": "VLMM Proxy"
 	}
