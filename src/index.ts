@@ -1,149 +1,176 @@
 /**
  * VLMM proxy on Cloudflare Workers — OpenRouter + BigModel (GLM-4.5V)
- *  - POST /v1/vision/analyze  (JSON or multipart/form-data)
- *  - POST /v1/vision/stream   (SSE passthrough)
- *  - GET  /healthz
+ * Minimal update: add **our own progress SSE** when `stream=true` while keeping
+ * passthrough of provider SSE intact. This is designed for the use‑case
+ * "one image per request" where upstream gives few/no internal phases.
  *
- * Changes in this version:
- *  - Added provider "bigmodel" with model "glm-4.5v" via https://open.bigmodel.cn/api/paas/v4/chat/completions
- *  - Unified payload builder for vision (text + image_url / data URL)
- *  - Provider switch: body.provider | URL ?provider= | default → "bigmodel"
+ * Routes
+ *  - POST /v1/vision/analyze  (JSON or multipart/form-data)
+ *    • with body.stream=true or ?stream=1 -> SSE with early progress events
+ *  - POST /v1/vision/stream   (alias of analyze with stream=true)
+ *  - GET  /healthz
  */
 
 export interface Env {
-  OPENROUTER_API_KEY?: string;  // optional if you use only BigModel
-  BIGMODEL_API_KEY: string;      // wrangler secret put BIGMODEL_API_KEY
-  DEFAULT_MODEL?: string;        // e.g. "glm-4.5v" (BigModel) or any OpenRouter model
-  ALLOWED_ORIGINS?: string;      // comma-separated list
-  APP_URL?: string;              // (OpenRouter attribution) Referer
-  APP_TITLE?: string;            // (OpenRouter attribution) X-Title
+  // API keys
+  OPENROUTER_API_KEY?: string;           // optional if using only BigModel
+  BIGMODEL_API_KEY?: string;             // optional if using only OpenRouter
+
+  // Defaults & attribution
+  DEFAULT_MODEL?: string;                // e.g. "glm-4.5v" or any OpenRouter model
+  APP_URL?: string;                      // Referer for OpenRouter attribution
+  APP_TITLE?: string;                    // X-Title for OpenRouter attribution
+
+  // CORS
+  ALLOWED_ORIGINS?: string;              // comma-separated list
+
+  // Progress tuning (all optional)
+  PROGRESS_TTFB_P50_MS?: string;         // median time to first byte (headers) from upstream
+  PROGRESS_TOTAL_P50_MS?: string;        // median total time for one-image request
+  PROGRESS_TAIL_MAX?: string;            // e.g. "0.99" — progress ceiling before real completion
+  STREAM_HEARTBEAT_MS?: string;          // heartbeat frequency in ms
 }
 
-// ---- Utilities -------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Utilities
+// ---------------------------------------------------------------------------
 
 const DEFAULT_ALLOWED_ORIGINS = [
   "http://localhost:3000",
-  "http://localhost:5173",
   "http://127.0.0.1:3000",
+  "http://localhost:3333",
+  "http://localhost:5173",
 ];
 
 function corsHeadersFor(req: Request, env: Env, extra: Record<string, string> = {}) {
   const origin = req.headers.get("Origin") || "";
-  const allowed = new Set<string>(
-    (env.ALLOWED_ORIGINS ? env.ALLOWED_ORIGINS.split(/,\s*/) : DEFAULT_ALLOWED_ORIGINS)
-  );
-  const headers: Record<string, string> = {
-    "Vary": "Origin",
-    "Access-Control-Allow-Methods": "POST, OPTIONS",
+  const allowed = new Set<string>([
+    ...DEFAULT_ALLOWED_ORIGINS,
+    ...(env.ALLOWED_ORIGINS ? env.ALLOWED_ORIGINS.split(",").map(s => s.trim()).filter(Boolean) : []),
+    ...(env.APP_URL ? [env.APP_URL] : []),
+  ]);
+  const headers: Record<string,string> = {
+    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
     "Access-Control-Allow-Headers": "Content-Type, Authorization",
     "Access-Control-Max-Age": "86400",
+    "Content-Security-Policy": "default-src 'none'",
     ...extra,
   };
-  if (origin && allowed.has(origin)) {
-    headers["Access-Control-Allow-Origin"] = origin;
-  }
+  if (origin && allowed.has(origin)) headers["Access-Control-Allow-Origin"] = origin;
   return headers;
 }
 
 function jsonResponse(req: Request, env: Env, body: unknown, status = 200) {
   return new Response(JSON.stringify(body), {
     status,
-    headers: { "content-type": "application/json; charset=utf-8", ...corsHeadersFor(req, env) },
+    headers: {
+      "content-type": "application/json; charset=utf-8",
+      ...corsHeadersFor(req, env),
+    },
   });
 }
 
-async function fileToDataURL(file: File): Promise<{url: string; mime: string}> {
-  const mime = file.type || "image/jpeg";
-  const buf = new Uint8Array(await file.arrayBuffer());
-  let binary = "";
-  for (let i = 0; i < buf.length; i++) binary += String.fromCharCode(buf[i]);
-  const b64 = btoa(binary);
-  return { url: `data:${mime};base64,${b64}` , mime };
-}
-
-function getQueryFlag(url: URL, name: string): boolean | undefined {
+function getQueryFlag(url: URL, name: string) {
   const v = url.searchParams.get(name);
-  if (v === null) return undefined;
-  if (v === "1" || v === "true" || v === "yes") return true;
-  if (v === "0" || v === "false" || v === "no") return false;
+  if (v == null) return undefined;
+  if (v === "" || v === "1" || v.toLowerCase() === "true") return true;
+  if (v === "0" || v.toLowerCase() === "false") return false;
   return undefined;
 }
 
-// ---- Input parsing ---------------------------------------------------------
+function pickProvider(provider?: string) {
+  if (!provider) return "bigmodel"; // default
+  return provider === "openrouter" ? "openrouter" : "bigmodel";
+}
+
+function defaultModelFor(env: Env, provider: "openrouter" | "bigmodel") {
+  if (env.DEFAULT_MODEL && env.DEFAULT_MODEL.trim()) return env.DEFAULT_MODEL.trim();
+  return provider === "openrouter" ? "qwen/qwen2.5-vl-72b-instruct" : "glm-4.5v";
+}
+
+// ---------------------------------------------------------------------------
+// Input parsing for /v1/vision/analyze
+// ---------------------------------------------------------------------------
 
 type AnalyzeInput = {
   provider?: "bigmodel" | "openrouter";
   model?: string;
   prompt?: string;
-  image_url?: string;           // http(s) or data URL
-  image_base64?: string;        // raw base64 without data: prefix
+  image_url?: string;             // http(s) or data URL
+  image_base64?: string;          // raw base64 (without data: prefix)
   detail?: "low" | "high" | "auto";
   stream?: boolean;
-  thinking?: "enabled" | "disabled"; // BigModel-specific switch
-  images?: string[];            // optional multiple images (urls or data URLs)
+  thinking?: "enabled" | "disabled" | { type: "enabled" | "disabled" }; // BigModel-specific
+  images?: string[];              // optional multiple images
 };
 
 async function parseAnalyzePayload(req: Request): Promise<AnalyzeInput> {
-  const ct = req.headers.get("content-type") || "";
-  if (ct.includes("multipart/form-data")) {
-    const form = await req.formData();
-    const file = form.get("file");
-    const prompt = (form.get("prompt") || "") as string;
-    const model = (form.get("model") || "") as string;
-    const provider = (form.get("provider") || "") as string;
-    const detail = (form.get("detail") || "auto") as AnalyzeInput["detail"];
-    const thinking = (form.get("thinking") || "") as AnalyzeInput["thinking"];
-
-    let image_url = (form.get("image_url") || "") as string;
-    let image_base64 = (form.get("image_base64") || "") as string;
-
-    if (!image_url && !image_base64 && file instanceof File) {
-      const { url } = await fileToDataURL(file);
-      image_url = url;
+  const ctype = req.headers.get("content-type") || "";
+  if (ctype.includes("application/json")) {
+    return (await req.json()) as AnalyzeInput;
+  }
+  if (ctype.includes("multipart/form-data")) {
+    const fd = await req.formData();
+    const out: any = {};
+    for (const [k, v] of fd.entries()) {
+      if (typeof v === "string") out[k] = v;
     }
-
-    return { provider: provider as any, model, prompt, image_url, image_base64, detail, thinking };
+    // normalize types
+    if (out.stream != null) out.stream = String(out.stream).toLowerCase() !== "false";
+    if (out.images && typeof out.images === "string") {
+      try { out.images = JSON.parse(out.images); } catch {}
+    }
+    return out as AnalyzeInput;
   }
-
-  // JSON
-  const body = (await req.json().catch(() => ({}))) as AnalyzeInput;
-  return body;
+  // default
+  try { return (await req.json()) as AnalyzeInput; } catch { return {}; }
 }
 
-// Build OpenAI-style multi-modal message for both providers
-function buildMessages(input: AnalyzeInput) {
+// ---------------------------------------------------------------------------
+// Payload builder (OpenAI Chat API compatible messages)
+// ---------------------------------------------------------------------------
+
+function buildVisionPayload(input: AnalyzeInput, provider: "openrouter" | "bigmodel", env: Env) {
+  const model = input.model?.trim() || defaultModelFor(env, provider);
   const content: any[] = [];
+  if (input.prompt) content.push({ type: "text", text: input.prompt });
 
-  const pushImage = (url: string) => {
-    if (!url) return;
-    content.push({ type: "image_url", image_url: { url, ...(input.detail ? { detail: input.detail } : {}) } });
-  };
+  const images: string[] = [];
+  if (input.image_url) images.push(input.image_url);
+  if (input.image_base64) images.push(`data:image/png;base64,${input.image_base64}`);
+  if (Array.isArray(input.images)) images.push(...input.images);
 
-  if (Array.isArray(input.images) && input.images.length) {
-    input.images.forEach(pushImage);
-  } else {
-    if (input.image_url) pushImage(input.image_url);
-    else if (input.image_base64) pushImage(`data:image/jpeg;base64,${input.image_base64}`);
+  for (const url of images) {
+    content.push({ type: "image_url", image_url: { url } });
   }
 
-  if (input.prompt && input.prompt.trim()) {
-    content.push({ type: "text", text: input.prompt });
+  const messages = [{ role: "user", content }];
+  const payload: any = { model, messages };
+  // BigModel требует объект { type: "enabled" | "disabled" } в поле thinking
+  if (provider === "bigmodel") {
+    const t: any = (input as any).thinking;
+    if (t === "enabled" || t === "disabled") {
+      payload.thinking = { type: t };
+    } else if (t && typeof t === "object" && typeof t.type === "string") {
+      payload.thinking = { type: t.type };
+    }
+    // если thinking невалидный или отсутствует — просто не добавляем поле
   }
-
-  // If no content, enforce at least a default text
-  if (!content.length) content.push({ type: "text", text: "Describe the image briefly." });
-
-  return [{ role: "user", content }];
+  return payload;
 }
 
-// ---- Providers -------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Upstream callers
+// ---------------------------------------------------------------------------
 
 async function callBigModel(env: Env, payload: any, stream = false) {
   const url = new URL("https://open.bigmodel.cn/api/paas/v4/chat/completions");
-  const headers: Record<string, string> = {
-    Authorization: `Bearer ${env.BIGMODEL_API_KEY}`,
-    "Content-Type": "application/json",
+  const headers: Record<string,string> = {
+    "content-type": "application/json",
   };
+  const token = env.BIGMODEL_API_KEY?.trim();
+  if (token) headers["authorization"] = `Bearer ${token}`;
+
   const init: RequestInit = {
     method: "POST",
     headers,
@@ -153,12 +180,12 @@ async function callBigModel(env: Env, payload: any, stream = false) {
 }
 
 async function callOpenRouter(env: Env, payload: any, stream = false) {
-  if (!env.OPENROUTER_API_KEY) throw new Error("OPENROUTER_API_KEY is not set");
   const url = new URL("https://openrouter.ai/api/v1/chat/completions");
-  const headers: Record<string, string> = {
-    Authorization: `Bearer ${env.OPENROUTER_API_KEY}`,
-    "Content-Type": "application/json",
+  const headers: Record<string,string> = {
+    "content-type": "application/json",
   };
+  const token = env.OPENROUTER_API_KEY?.trim();
+  if (token) headers["authorization"] = `Bearer ${token}`;
   if (env.APP_URL) headers["HTTP-Referer"] = env.APP_URL;
   if (env.APP_TITLE) headers["X-Title"] = env.APP_TITLE;
 
@@ -170,21 +197,123 @@ async function callOpenRouter(env: Env, payload: any, stream = false) {
   return fetch(url.toString(), init);
 }
 
-function providerFrom(input: AnalyzeInput, url: URL): "bigmodel" | "openrouter" {
-  const p = input.provider || (url.searchParams.get("provider") as any);
-  return p === "openrouter" ? "openrouter" : "bigmodel"; // default BigModel
+// ---------------------------------------------------------------------------
+// SSE helpers (our progress + passthrough upstream)
+// ---------------------------------------------------------------------------
+
+function sseLine(type: string | null, data: any, id?: string) {
+  let out = "";
+  if (id) out += `id: ${id}\n`;
+  if (type) out += `event: ${type}\n`;
+  out += `data: ${JSON.stringify(data)}\n\n`;
+  return out;
 }
 
-function modelFrom(input: AnalyzeInput, env: Env, provider: string): string {
-  if (input.model && input.model.trim()) return input.model;
-  if (env.DEFAULT_MODEL && env.DEFAULT_MODEL.trim()) return env.DEFAULT_MODEL;
-  return provider === "openrouter" ? "qwen/qwen2.5-vl-72b-instruct" : "glm-4.5v";
+function nowMs() { return Date.now(); }
+
+function parseNumber(v: string | undefined, fallback: number) {
+  const n = v ? Number(v) : NaN;
+  return Number.isFinite(n) ? n : fallback;
 }
 
-// ---- Worker routes ---------------------------------------------------------
+// Create a Response that emits our progress events, then pipes the upstream SSE as-is.
+async function progressWrappedSSE(req: Request, env: Env, upstreamPromise: Promise<Response>) {
+  const started = nowMs();
+  const TTFB = parseNumber(env.PROGRESS_TTFB_P50_MS, 600);
+  const TOTAL = parseNumber(env.PROGRESS_TOTAL_P50_MS, 3500);
+  const TAIL_MAX = Math.max(0.9, Math.min(0.999, parseNumber(env.PROGRESS_TAIL_MAX, 0.99)));
+  const HEARTBEAT_MS = Math.max(3000, parseNumber(env.STREAM_HEARTBEAT_MS, 7000));
+
+  let progress = 0; // 0..1
+  let lastEmit = 0;
+  let hbTimer: number | undefined;
+
+  const stream = new ReadableStream<Uint8Array>({
+    async start(controller) {
+      // Emit early phases we control entirely
+      controller.enqueue(new TextEncoder().encode(sseLine("progress", { percent: 5, phase: "queued" })));
+      controller.enqueue(new TextEncoder().encode(sseLine("progress", { percent: 10, phase: "selecting_provider" })));
+
+      // Start upstream fetch
+      const up = await upstreamPromise;
+      const headersReceivedAt = nowMs();
+      progress = Math.max(progress, 0.35); // headers -> jump to ~35%
+      controller.enqueue(new TextEncoder().encode(sseLine("progress", {
+        percent: Math.round(progress * 1000)/10,
+        phase: "headers_received",
+        ttfbMs: headersReceivedAt - started,
+        status: up.status,
+      })));
+
+      // Heartbeat (keeps connection alive)
+      hbTimer = (setInterval as any)(() => {
+        controller.enqueue(new TextEncoder().encode(sseLine("heartbeat", { ts: nowMs() })));
+      }, HEARTBEAT_MS);
+
+      // While we are waiting for upstream body end, push a gentle time-based growth up to tail
+      const softTicker = (setInterval as any)(() => {
+        const elapsed = nowMs() - started;
+        const est = Math.max(TOTAL, 1200);
+        const target = Math.min(TAIL_MAX, elapsed / est);
+        if (target > progress + 0.02 && target <= TAIL_MAX) {
+          progress = target;
+          const pct = Math.round(progress * 1000)/10;
+          // throttle emits to ~200ms min interval
+          if (nowMs() - lastEmit > 200) {
+            lastEmit = nowMs();
+            controller.enqueue(new TextEncoder().encode(sseLine("progress", { percent: pct, phase: "upstream_wait" })));
+          }
+        }
+      }, 250);
+
+      // Passthrough upstream SSE bytes as-is (to keep compatibility with clients parsing provider format)
+      if (!up.body) {
+        clearInterval(softTicker); if (hbTimer) clearInterval(hbTimer);
+        controller.enqueue(new TextEncoder().encode(sseLine("error", { code: "NO_UPSTREAM_BODY" })));
+        controller.close();
+        return;
+      }
+
+      const reader = up.body.getReader();
+      const encoder = new TextEncoder();
+      const pushDone = async () => {
+        try {
+          while (true) {
+            const { value, done } = await reader.read();
+            if (done) break;
+            if (value) controller.enqueue(value);
+          }
+        } catch (e) {
+          controller.enqueue(encoder.encode(sseLine("error", { code: "UPSTREAM_READ", message: (e as Error).message })));
+        }
+      };
+
+      await pushDone();
+
+      // Finish with our tail & complete
+      clearInterval(softTicker); if (hbTimer) clearInterval(hbTimer);
+      progress = 1;
+      controller.enqueue(encoder.encode(sseLine("progress", { percent: 99, phase: "finalize" })));
+      controller.enqueue(encoder.encode(sseLine("complete", { finishedAt: nowMs(), elapsedMs: nowMs() - started })));
+      controller.close();
+    },
+  });
+
+  const headers = new Headers({
+    "content-type": "text/event-stream; charset=utf-8",
+    "cache-control": "no-cache, no-transform",
+    "x-accel-buffering": "no",
+    ...corsHeadersFor(req, env),
+  });
+  return new Response(stream, { status: 200, headers });
+}
+
+// ---------------------------------------------------------------------------
+// Worker routes
+// ---------------------------------------------------------------------------
 
 export default {
-  async fetch(req: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+  async fetch(req: Request, env: Env): Promise<Response> {
     const url = new URL(req.url);
 
     // CORS preflight
@@ -193,42 +322,33 @@ export default {
     }
 
     if (url.pathname === "/healthz") {
-      return new Response("ok", { headers: corsHeadersFor(req, env) });
+      return jsonResponse(req, env, { ok: true, ts: Date.now() });
     }
 
     if ((url.pathname === "/v1/vision/analyze" || url.pathname === "/v1/vision/stream") && req.method === "POST") {
       try {
         const input = await parseAnalyzePayload(req);
-        const provider = providerFrom(input, url);
-        const model = modelFrom(input, env, provider);
-        const stream = url.pathname.endsWith("/stream") || !!input.stream || getQueryFlag(url, "stream") === true;
+        const provider = pickProvider(input.provider);
+        const streamFlag = url.pathname.endsWith("/stream") || !!input.stream || getQueryFlag(url, "stream") === true;
+        const payload = buildVisionPayload(input, provider, env);
 
-        const messages = buildMessages(input);
-        const payload: any = { model, messages };
+        const upstreamPromise = provider === "openrouter"
+          ? callOpenRouter(env, payload, streamFlag)
+          : callBigModel(env, payload, streamFlag);
 
-        // BigModel-specific: thinking switch
-        if (provider === "bigmodel") {
-          if (input.thinking === "enabled") payload.thinking = { type: "enabled" };
-          if (input.thinking === "disabled") payload.thinking = { type: "disabled" };
-        }
-
-        const upstream = provider === "openrouter"
-          ? await callOpenRouter(env, payload, stream)
-          : await callBigModel(env, payload, stream);
-
-        if (stream) {
-          // SSE passthrough
-          // Ensure CORS + proper content-type
-          const headers = new Headers(upstream.headers);
-          headers.set("content-type", "text/event-stream; charset=utf-8");
-          for (const [k, v] of Object.entries(corsHeadersFor(req, env))) headers.set(k, v);
-          return new Response(upstream.body, { status: upstream.status, headers });
+        if (streamFlag) {
+          // Our SSE with early progress, then passthrough upstream SSE
+          return progressWrappedSSE(req, env, upstreamPromise);
         }
 
         // Non-stream JSON
-        const data = await upstream.json();
+        const upstream = await upstreamPromise;
+        const json = await upstream.json().catch(() => null);
         const headers = corsHeadersFor(req, env);
-        return new Response(JSON.stringify(data), { status: upstream.status, headers: { "content-type": "application/json", ...headers } });
+        return new Response(JSON.stringify(json ?? { error: "bad upstream json" }), {
+          status: upstream.status,
+          headers: { "content-type": "application/json; charset=utf-8", ...headers },
+        });
       } catch (e: any) {
         return jsonResponse(req, env, { error: e?.message || "Bad Request" }, 400);
       }
