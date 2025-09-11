@@ -12,6 +12,11 @@ lerna-debug.log*
 
 report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
 
+
+# AI
+ai_docs_backend/
+
+
 # Runtime data
 
 pids
