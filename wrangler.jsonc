@@ -2,7 +2,7 @@
  * For more details on how to configure Wrangler, refer to:
  * https://developers.cloudflare.com/workers/wrangler/configuration/
  */
- /**
+/**
 "DEFAULT_MODEL": "qwen/qwen2.5-vl-72b-instruct",
  */
 {
@@ -16,9 +16,49 @@
 	"vars": {
 		"ALLOWED_ORIGINS": "https://vlm-api-front.vercel.app,http://localhost:3000",
 		"DEFAULT_MODEL": "glm-4.5v",
-    	"APP_URL": "vlm-api-front.vercel.app",
-    	"APP_TITLE": "VLMM Proxy"
-	}
+		"APP_URL": "vlm-api-front.vercel.app",
+		"APP_TITLE": "VLMM Proxy",
+		"ADMIN_TOKEN": "test-admin",
+		"ENABLE_SCHEMA_BOOTSTRAP": "1"
+	},
+	"d1_databases": [
+		{
+			"binding": "vlm_api_db",
+			"database_name": "vlm-api-db",
+			"database_id": "97d1e5c4-8964-4261-8194-feae036c7d9a"
+		}
+	],
+	"kv_namespaces": [
+		{
+			"binding": "PROMPT_CACHE",
+			"id": "123aeee3ad654d898c74c6f55ceeb3cb"
+		}
+	],
+	"r2_buckets": [
+		{
+			"binding": "BACKUPS",
+			"bucket_name": "vlmm-worker-backups"
+		}
+	],
+		"triggers": {
+			"crons": ["0 3 * * *"]
+		},
+		"env": {
+			"stage": {
+				"vars": {
+					"ALLOWED_ORIGINS": "https://stage.your-app.com,http://localhost:3000",
+					"APP_TITLE": "VLMM Proxy (stage)",
+					"ENABLE_SCHEMA_BOOTSTRAP": "0"
+				}
+			},
+			"production": {
+				"vars": {
+					"ALLOWED_ORIGINS": "https://your-app.com",
+					"APP_TITLE": "VLMM Proxy",
+					"ENABLE_SCHEMA_BOOTSTRAP": "0"
+				}
+			}
+		}
 	/**
 	 * Smart Placement
 	 * Docs: https://developers.cloudflare.com/workers/configuration/smart-placement/#smart-placement
@@ -34,7 +74,6 @@
 	 * Environment Variables
 	 * https://developers.cloudflare.com/workers/wrangler/configuration/#environment-variables
 	 */
-	
 	/**
 	 * Note: Use secrets to store sensitive data.
 	 * https://developers.cloudflare.com/workers/configuration/secrets/

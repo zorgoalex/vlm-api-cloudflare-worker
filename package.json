@@ -7,6 +7,10 @@
 		"dev": "wrangler dev",
 		"start": "wrangler dev",
 		"test": "vitest",
+		"typecheck": "tsc -p tsconfig.json --noEmit",
+		"db:seed": "wrangler d1 execute vlm-api-db --file=./seeds/0001_seed_prompts.sql",
+		"db:export": "wrangler d1 export vlm-api-db --output=./d1-exports/dump.sql",
+		"db:import": "wrangler d1 execute vlm-api-db --file=./d1-exports/dump.sql",
 		"cf-typegen": "wrangler types"
 	},
 	"devDependencies": {

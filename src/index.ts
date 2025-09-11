@@ -1,3 +1,5 @@
+import { OPENAPI_YAML } from './openapi';
+
 /**
  * VLMM proxy on Cloudflare Workers — OpenRouter + BigModel (GLM-4.5V)
  * Minimal update: add **our own progress SSE** when `stream=true` while keeping
@@ -29,6 +31,23 @@ export interface Env {
   PROGRESS_TOTAL_P50_MS?: string;        // median total time for one-image request
   PROGRESS_TAIL_MAX?: string;            // e.g. "0.99" — progress ceiling before real completion
   STREAM_HEARTBEAT_MS?: string;          // heartbeat frequency in ms
+
+  // Prompts storage (D1 + KV)
+  vlm_api_db: D1Database;                // D1 binding name from wrangler.jsonc
+  PROMPT_CACHE: KVNamespace;             // KV cache for prompts
+  ADMIN_TOKEN?: string;                  // admin token for write operations
+  ENABLE_SCHEMA_BOOTSTRAP?: string;      // '1' to allow auto-DDL in dev/test
+  // Optional read auth (disabled by default)
+  REQUIRE_READ_AUTH?: string;            // '1' to require read auth
+  READ_BEARER_TOKEN?: string;            // Bearer token for GET endpoints
+  // Rate limiting & anti-replay (disabled by default)
+  WRITE_RL_LIMIT?: string;               // e.g. '20' requests
+  WRITE_RL_WINDOW_SEC?: string;          // e.g. '60' seconds window
+  ENABLE_NONCE_REQUIRED_FOR_WRITE?: string; // '1' to require X-Nonce on writes
+  NONCE_TTL_SEC?: string;                // e.g. '300'
+  // R2 backups
+  BACKUPS?: R2Bucket;                    // R2 bucket binding for backups
+  BACKUP_PREFIX?: string;                // e.g. 'd1-backups/'
 }
 
 // ---------------------------------------------------------------------------
@@ -51,7 +70,7 @@ function corsHeadersFor(req: Request, env: Env, extra: Record<string, string> = 
   ]);
   const headers: Record<string,string> = {
     "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type, Authorization",
+    "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Admin-Token, X-Nonce",
     "Access-Control-Max-Age": "86400",
     "Content-Security-Policy": "default-src 'none'",
     ...extra,
@@ -68,6 +87,162 @@ function jsonResponse(req: Request, env: Env, body: unknown, status = 200) {
       ...corsHeadersFor(req, env),
     },
   });
+}
+
+function generateRequestId() {
+  // lightweight request id
+  const rnd = Math.random().toString(36).slice(2, 8);
+  return `${Date.now().toString(36)}-${rnd}`;
+}
+
+function errorResponse(req: Request, env: Env, opts: { code: string; message: string; status?: number; details?: any }, requestId?: string) {
+  const rid = requestId || generateRequestId();
+  const body = { error: opts.message, code: opts.code, request_id: rid, ...(opts.details ? { details: opts.details } : {}) };
+  return new Response(JSON.stringify(body), {
+    status: opts.status ?? 400,
+    headers: {
+      "content-type": "application/json; charset=utf-8",
+      "x-request-id": rid,
+      ...corsHeadersFor(req, env),
+    },
+  });
+}
+
+function logInfo(fields: Record<string, unknown>) {
+  try { console.log(JSON.stringify({ level: 'info', ts: Date.now(), ...fields })); } catch { /* noop */ }
+}
+function logWarn(fields: Record<string, unknown>) {
+  try { console.warn(JSON.stringify({ level: 'warn', ts: Date.now(), ...fields })); } catch { /* noop */ }
+}
+function logError(fields: Record<string, unknown>) {
+  try { console.error(JSON.stringify({ level: 'error', ts: Date.now(), ...fields })); } catch { /* noop */ }
+}
+
+// ---------------------------------------------------------------------------
+// D1 + KV (Prompts) helpers
+// ---------------------------------------------------------------------------
+
+const promptsKVKeyList    = (ns: string, lang?: string, act?: string) => `list:${ns}:${lang ?? "*"}:${act ?? "*"}`;
+const promptsKVKeyById    = (id: number) => `id:${id}`;
+const promptsKVKeyDefault = (ns: string, lang: string) => `default:${ns}:${lang}`;
+
+const mapPromptRow = (r: any) => ({
+  id: r.prompt_id,
+  namespace: r.prompt_namespace,
+  name: r.prompt_name,
+  version: r.prompt_version,
+  lang: r.prompt_lang,
+  text: r.prompt_text,
+  tags: (() => { try { return JSON.parse(r.prompt_tags || "[]"); } catch { return []; } })(),
+  is_active: r.prompt_is_active,
+  is_default: r.prompt_is_default,
+  created_at: r.prompt_created_at,
+  updated_at: r.prompt_updated_at,
+});
+
+let schemaReady = false;
+async function ensurePromptsSchema(env: Env) {
+  if (env.ENABLE_SCHEMA_BOOTSTRAP !== '1') return; // only in dev/test
+  if (schemaReady) return;
+  // Best‑effort create schema for ephemeral test/dev environments
+  // Ensure core table first (no swallow)
+  await env.vlm_api_db.prepare(`CREATE TABLE IF NOT EXISTS prompts (
+      prompt_id          INTEGER PRIMARY KEY AUTOINCREMENT,
+      prompt_namespace   TEXT NOT NULL DEFAULT 'default',
+      prompt_name        TEXT NOT NULL,
+      prompt_version     INTEGER NOT NULL DEFAULT 1,
+      prompt_lang        TEXT NOT NULL DEFAULT 'ru',
+      prompt_text        TEXT NOT NULL,
+      prompt_tags        TEXT NOT NULL DEFAULT '[]',
+      prompt_is_active   INTEGER NOT NULL DEFAULT 1,
+      prompt_is_default  INTEGER NOT NULL DEFAULT 0,
+      prompt_created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+      prompt_updated_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+    );`).run();
+  const stmts = [
+    `CREATE UNIQUE INDEX IF NOT EXISTS ux_prompts_ns_name_ver
+       ON prompts(prompt_namespace, prompt_name, prompt_version);`,
+    `CREATE INDEX IF NOT EXISTS ix_prompts_ns               ON prompts(prompt_namespace);`,
+    `CREATE INDEX IF NOT EXISTS ix_prompts_lang             ON prompts(prompt_lang);`,
+    `CREATE INDEX IF NOT EXISTS ix_prompts_active           ON prompts(prompt_is_active);`,
+    `CREATE INDEX IF NOT EXISTS ix_prompts_ns_lang_active   ON prompts(prompt_namespace, prompt_lang, prompt_is_active);`,
+    `CREATE INDEX IF NOT EXISTS ix_prompts_default          ON prompts(prompt_namespace, prompt_lang, prompt_is_default);`,
+    `CREATE TRIGGER IF NOT EXISTS trg_prompts_updated_at
+       AFTER UPDATE ON prompts
+       FOR EACH ROW BEGIN
+         UPDATE prompts SET prompt_updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE prompt_id = NEW.prompt_id;
+       END;`
+  ];
+  for (const sql of stmts) {
+    await env.vlm_api_db.prepare(sql).run().catch(() => undefined);
+  }
+  schemaReady = true;
+}
+
+// ---------------------------------------------------------------------------
+// Security helpers (optional)
+// ---------------------------------------------------------------------------
+
+function requireReadAuth(env: Env): boolean {
+  return env.REQUIRE_READ_AUTH === '1' && !!(env.READ_BEARER_TOKEN && env.READ_BEARER_TOKEN.trim());
+}
+
+function verifyReadAuth(req: Request, env: Env): Response | null {
+  if (!requireReadAuth(env)) return null;
+  const auth = req.headers.get('authorization') || req.headers.get('Authorization') || '';
+  const ok = auth.startsWith('Bearer ') && auth.slice(7).trim() === (env.READ_BEARER_TOKEN || '').trim();
+  if (!ok) return errorResponse(req, env, { code: 'UNAUTHORIZED', message: 'unauthorized', status: 401 });
+  return null;
+}
+
+function parseIntEnv(v: string | undefined, d: number) {
+  const n = v ? parseInt(v, 10) : NaN;
+  return Number.isFinite(n) ? n : d;
+}
+
+async function rateLimitWrite(req: Request, env: Env, routeKey: string): Promise<Response | null> {
+  const limit = parseIntEnv(env.WRITE_RL_LIMIT, 0);
+  const windowSec = Math.max(1, parseIntEnv(env.WRITE_RL_WINDOW_SEC, 60));
+  if (!limit || limit <= 0) return null; // disabled
+
+  const ip = req.headers.get('CF-Connecting-IP') || '0.0.0.0';
+  const admin = req.headers.get('X-Admin-Token') || 'no-admin';
+  const key = `rl:${routeKey}:${admin}:${ip}`;
+  const now = Math.floor(Date.now() / 1000);
+
+  const recStr = await env.PROMPT_CACHE.get(key);
+  if (!recStr) {
+    await env.PROMPT_CACHE.put(key, JSON.stringify({ c: 1, s: now }), { expirationTtl: windowSec });
+    return null;
+  }
+  try {
+    const rec = JSON.parse(recStr || '{}') as { c: number; s: number };
+    if (rec.c >= limit) {
+      const resetIn = windowSec - (now - (rec.s || now));
+      return new Response(JSON.stringify({ error: 'rate_limited', code: 'RATE_LIMITED', request_id: generateRequestId() }), {
+        status: 429,
+        headers: { 'content-type': 'application/json; charset=utf-8', 'x-ratelimit-limit': String(limit), 'x-ratelimit-remaining': '0', 'x-ratelimit-reset': String(Math.max(0, resetIn)), ...corsHeadersFor(req, env) },
+      });
+    }
+    rec.c += 1;
+    await env.PROMPT_CACHE.put(key, JSON.stringify(rec), { expirationTtl: windowSec });
+    return null;
+  } catch {
+    await env.PROMPT_CACHE.put(key, JSON.stringify({ c: 1, s: now }), { expirationTtl: windowSec });
+    return null;
+  }
+}
+
+async function verifyNonce(req: Request, env: Env): Promise<Response | null> {
+  if (env.ENABLE_NONCE_REQUIRED_FOR_WRITE !== '1') return null;
+  const nonce = req.headers.get('X-Nonce');
+  if (!nonce) return errorResponse(req, env, { code: 'NONCE_REQUIRED', message: 'nonce required', status: 400 });
+  const key = `nonce:${nonce}`;
+  const exists = await env.PROMPT_CACHE.get(key);
+  if (exists) return errorResponse(req, env, { code: 'REPLAY', message: 'nonce already used', status: 409 });
+  const ttl = Math.max(30, parseIntEnv(env.NONCE_TTL_SEC, 300));
+  await env.PROMPT_CACHE.put(key, '1', { expirationTtl: ttl });
+  return null;
 }
 
 function getQueryFlag(url: URL, name: string) {
@@ -315,6 +490,13 @@ async function progressWrappedSSE(req: Request, env: Env, upstreamPromise: Promi
 export default {
   async fetch(req: Request, env: Env): Promise<Response> {
     const url = new URL(req.url);
+    const rid = req.headers.get('x-request-id') || generateRequestId();
+    const started = nowMs();
+
+    // Prepare D1 schema early for any /v1/prompts* request (helps in test/dev)
+    if (url.pathname.startsWith("/v1/prompts") && env.ENABLE_SCHEMA_BOOTSTRAP === '1') {
+      await ensurePromptsSchema(env);
+    }
 
     // CORS preflight
     if (req.method === "OPTIONS") {
@@ -322,7 +504,52 @@ export default {
     }
 
     if (url.pathname === "/healthz") {
-      return jsonResponse(req, env, { ok: true, ts: Date.now() });
+      const resp = jsonResponse(req, env, { ok: true, ts: Date.now() });
+      logInfo({ request_id: rid, route: '/healthz', method: req.method, status: 200, latency_ms: nowMs() - started });
+      return resp;
+    }
+
+    if (url.pathname === "/about") {
+      const flags = {
+        require_read_auth: env.REQUIRE_READ_AUTH === '1',
+        write_rate_limit: !!(env.WRITE_RL_LIMIT && env.WRITE_RL_WINDOW_SEC),
+        nonce_required_for_write: env.ENABLE_NONCE_REQUIRED_FOR_WRITE === '1',
+        schema_bootstrap: env.ENABLE_SCHEMA_BOOTSTRAP === '1',
+      };
+      const out = {
+        name: 'vlmm-worker',
+        version: env.APP_TITLE ? `${env.APP_TITLE}` : 'dev',
+        app_version: (env as any).APP_VERSION || undefined,
+        environment: (env as any).ENV_NAME || 'dev',
+        openapi_url: '/openapi.yaml',
+        routes: ['/v1/vision/analyze', '/v1/vision/stream', '/v1/prompts', '/v1/prompts/{id}', '/v1/prompts/default', '/healthz'],
+        flags,
+      };
+      const resp = jsonResponse(req, env, out, 200);
+      logInfo({ request_id: rid, route: '/about', method: 'GET', status: 200, latency_ms: nowMs() - started });
+      return resp;
+    }
+
+    if (url.pathname === "/openapi.yaml") {
+      const headers = new Headers({ 'content-type': 'text/yaml; charset=utf-8', ...corsHeadersFor(req, env) });
+      logInfo({ request_id: rid, route: '/openapi.yaml', method: 'GET', status: 200, latency_ms: nowMs() - started });
+      return new Response(OPENAPI_YAML, { status: 200, headers });
+    }
+
+    // Manual backup trigger (admin only)
+    if (req.method === 'POST' && url.pathname === '/admin/backup') {
+      if ((req.headers.get('X-Admin-Token') || '') !== (env.ADMIN_TOKEN || '')) {
+        return errorResponse(req, env, { code: 'UNAUTHORIZED', message: 'unauthorized', status: 401 }, rid);
+      }
+      if (!env.BACKUPS) {
+        return errorResponse(req, env, { code: 'NO_BACKUP_BUCKET', message: 'R2 bucket BACKUPS not bound', status: 500 }, rid);
+      }
+      if (env.ENABLE_SCHEMA_BOOTSTRAP === '1') {
+        await ensurePromptsSchema(env);
+      }
+      const key = await backupPromptsToR2(env);
+      logInfo({ request_id: rid, route: '/admin/backup', method: 'POST', status: 200, key, latency_ms: nowMs() - started });
+      return jsonResponse(req, env, { ok: true, key }, 200);
     }
 
     if ((url.pathname === "/v1/vision/analyze" || url.pathname === "/v1/vision/stream") && req.method === "POST") {
@@ -338,22 +565,250 @@ export default {
 
         if (streamFlag) {
           // Our SSE with early progress, then passthrough upstream SSE
-          return progressWrappedSSE(req, env, upstreamPromise);
+          const resp = await progressWrappedSSE(req, env, upstreamPromise);
+          logInfo({ request_id: rid, route: '/v1/vision/stream', method: 'POST', provider, status: 200, stream: true, latency_ms: nowMs() - started });
+          return resp;
         }
 
         // Non-stream JSON
         const upstream = await upstreamPromise;
         const json = await upstream.json().catch(() => null);
         const headers = corsHeadersFor(req, env);
-        return new Response(JSON.stringify(json ?? { error: "bad upstream json" }), {
+        const resp = new Response(JSON.stringify(json ?? { error: "bad upstream json" }), {
           status: upstream.status,
           headers: { "content-type": "application/json; charset=utf-8", ...headers },
         });
+        logInfo({ request_id: rid, route: '/v1/vision/analyze', method: 'POST', provider, status: upstream.status, stream: false, latency_ms: nowMs() - started });
+        return resp;
       } catch (e: any) {
-        return jsonResponse(req, env, { error: e?.message || "Bad Request" }, 400);
+        logError({ request_id: rid, route: url.pathname, method: req.method, error: e?.message || String(e), latency_ms: nowMs() - started });
+        return errorResponse(req, env, { code: "BAD_REQUEST", message: e?.message || "Bad Request", status: 400 }, rid);
       }
     }
 
-    return jsonResponse(req, env, { error: "Not Found" }, 404);
+    // ---------------------------------------------------------------------
+    // Prompts API (D1 + KV)
+    // ---------------------------------------------------------------------
+
+    // (already ensured above when path startsWith /v1/prompts)
+
+    // LIST
+    if (req.method === "GET" && url.pathname === "/v1/prompts") {
+      const readAuth = verifyReadAuth(req, env); if (readAuth) return readAuth;
+      const ns   = url.searchParams.get("namespace") || "default";
+      const lang = url.searchParams.get("lang") || undefined;
+      const act  = url.searchParams.get("active") || undefined; // "1"|"0"
+      const q    = url.searchParams.get("q") || undefined;
+      const tag  = url.searchParams.get("tag") || undefined;
+      const limit = Math.max(1, Math.min(100, Number(url.searchParams.get("limit") || 50)));
+      const offset = Math.max(0, Number(url.searchParams.get("offset") || 0));
+
+      const canCache = !q && !tag && offset === 0; // don't cache search or offset pages
+      const cacheKey = promptsKVKeyList(ns, lang, act);
+      if (canCache) {
+        const cached = await env.PROMPT_CACHE.get(cacheKey, "json");
+        if (cached) {
+          logInfo({ request_id: rid, route: '/v1/prompts', method: 'GET', cache: 'HIT', namespace: ns, lang, active: act, q: !!q, tag: !!tag, count: Array.isArray(cached) ? cached.length : undefined, latency_ms: nowMs() - started });
+          return jsonResponse(req, env, cached, 200);
+        }
+      }
+
+      const where: string[] = ["prompt_namespace = ?"]; const args: any[] = [ns];
+      if (lang) { where.push("prompt_lang = ?"); args.push(lang); }
+      if (typeof act !== "undefined") { where.push("prompt_is_active = ?"); args.push(Number(act)); }
+      if (q) { where.push("(prompt_name LIKE ? OR prompt_text LIKE ?)"); args.push(`%${q}%`, `%${q}%`); }
+      if (tag) { where.push("EXISTS (SELECT 1 FROM json_each(prompts.prompt_tags) je WHERE je.value = ?)"); args.push(tag); }
+
+      const sql = `SELECT * FROM prompts WHERE ${where.join(" AND ")}
+                   ORDER BY prompt_namespace, prompt_name, prompt_version DESC
+                   LIMIT ? OFFSET ?`;
+      const rs = await env.vlm_api_db.prepare(sql).bind(...args, limit, offset).all();
+      const out = rs.results?.map(mapPromptRow) ?? [];
+      if (canCache) await env.PROMPT_CACHE.put(cacheKey, JSON.stringify(out), { expirationTtl: 60 });
+      logInfo({ request_id: rid, route: '/v1/prompts', method: 'GET', cache: canCache ? 'MISS' : 'BYPASS', namespace: ns, lang, active: act, q: !!q, tag: !!tag, count: out.length, latency_ms: nowMs() - started });
+      return jsonResponse(req, env, out, 200);
+    }
+
+    // GET BY ID
+    const mGet = url.pathname.match(/^\/v1\/prompts\/(\d+)$/);
+    if (req.method === "GET" && mGet) {
+      const readAuth = verifyReadAuth(req, env); if (readAuth) return readAuth;
+      const id = Number(mGet[1]);
+      const k = promptsKVKeyById(id);
+      const cached = await env.PROMPT_CACHE.get(k, "json");
+      if (cached) { logInfo({ request_id: rid, route: '/v1/prompts/:id', method: 'GET', cache: 'HIT', id, latency_ms: nowMs() - started }); return jsonResponse(req, env, cached, 200); }
+
+      const row = await env.vlm_api_db.prepare(`SELECT * FROM prompts WHERE prompt_id = ?`).bind(id).first();
+      if (!row) return errorResponse(req, env, { code: "NOT_FOUND", message: "not found", status: 404 });
+      const out = mapPromptRow(row);
+      await env.PROMPT_CACHE.put(k, JSON.stringify(out), { expirationTtl: 300 });
+      logInfo({ request_id: rid, route: '/v1/prompts/:id', method: 'GET', cache: 'MISS', id, latency_ms: nowMs() - started });
+      return jsonResponse(req, env, out, 200);
+    }
+
+    // GET DEFAULT
+    if (req.method === "GET" && url.pathname === "/v1/prompts/default") {
+      const readAuth = verifyReadAuth(req, env); if (readAuth) return readAuth;
+      const ns   = url.searchParams.get("namespace") || "default";
+      const lang = url.searchParams.get("lang") || "ru";
+      const k = promptsKVKeyDefault(ns, lang);
+      const cached = await env.PROMPT_CACHE.get(k, "json");
+      if (cached) { logInfo({ request_id: rid, route: '/v1/prompts/default', method: 'GET', cache: 'HIT', namespace: ns, lang, latency_ms: nowMs() - started }); return jsonResponse(req, env, cached, 200); }
+
+      const row = await env.vlm_api_db
+        .prepare(`SELECT * FROM prompts WHERE prompt_namespace = ? AND prompt_lang = ? AND prompt_is_default = 1 LIMIT 1`)
+        .bind(ns, lang).first();
+      if (!row) return errorResponse(req, env, { code: "NOT_FOUND", message: "not found", status: 404 });
+      const out = mapPromptRow(row);
+      await env.PROMPT_CACHE.put(k, JSON.stringify(out), { expirationTtl: 300 });
+      logInfo({ request_id: rid, route: '/v1/prompts/default', method: 'GET', cache: 'MISS', namespace: ns, lang, latency_ms: nowMs() - started });
+      return jsonResponse(req, env, out, 200);
+    }
+
+    // CREATE
+    if (req.method === "POST" && url.pathname === "/v1/prompts") {
+      if ((req.headers.get("X-Admin-Token") || "") !== (env.ADMIN_TOKEN || "")) {
+        return errorResponse(req, env, { code: "UNAUTHORIZED", message: "unauthorized", status: 401 });
+      }
+      const nonceCheck = await verifyNonce(req, env); if (nonceCheck) return nonceCheck;
+      const rl = await rateLimitWrite(req, env, 'prompts_create'); if (rl) return rl;
+      let body: any; try { body = await req.json(); } catch { return errorResponse(req, env, { code: "BAD_JSON", message: "invalid json", status: 400 }); }
+      if (!body || !body.name || !body.text) return errorResponse(req, env, { code: "BAD_INPUT", message: "name and text required", status: 400 });
+
+      // extra safety in dev/test only
+      if (env.ENABLE_SCHEMA_BOOTSTRAP === '1') {
+        await env.vlm_api_db.prepare(`CREATE TABLE IF NOT EXISTS prompts (
+          prompt_id          INTEGER PRIMARY KEY AUTOINCREMENT,
+          prompt_namespace   TEXT NOT NULL DEFAULT 'default',
+          prompt_name        TEXT NOT NULL,
+          prompt_version     INTEGER NOT NULL DEFAULT 1,
+          prompt_lang        TEXT NOT NULL DEFAULT 'ru',
+          prompt_text        TEXT NOT NULL,
+          prompt_tags        TEXT NOT NULL DEFAULT '[]',
+          prompt_is_active   INTEGER NOT NULL DEFAULT 1,
+          prompt_is_default  INTEGER NOT NULL DEFAULT 0,
+          prompt_created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+          prompt_updated_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+        );`).run().catch(() => undefined);
+      }
+
+      const ns     = body.namespace || "default";
+      const ver    = typeof body.version === "number" ? body.version : 1;
+      const lang   = body.lang || "ru";
+      const tags   = JSON.stringify(Array.isArray(body.tags) ? body.tags : []);
+      const active = typeof body.is_active === "number" ? body.is_active : 1;
+      const ts     = new Date().toISOString();
+
+      const res = await env.vlm_api_db.prepare(`
+        INSERT INTO prompts(
+          prompt_namespace, prompt_name, prompt_version, prompt_lang,
+          prompt_text, prompt_tags, prompt_is_active, prompt_is_default,
+          prompt_created_at, prompt_updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
+      `).bind(ns, body.name, ver, lang, body.text, tags, active, ts, ts).run();
+
+      const id = Number((res as any)?.meta?.last_row_id ?? (res as any)?.lastRowId ?? 0);
+      if (body.make_default) {
+        await env.vlm_api_db.batch([
+          env.vlm_api_db.prepare(`UPDATE prompts SET prompt_is_default = 0 WHERE prompt_namespace = ? AND prompt_lang = ?`).bind(ns, lang),
+          env.vlm_api_db.prepare(`UPDATE prompts SET prompt_is_default = 1 WHERE prompt_id = ?`).bind(id),
+        ]);
+        await env.PROMPT_CACHE.delete(promptsKVKeyDefault(ns, lang));
+      }
+
+      await env.PROMPT_CACHE.delete(promptsKVKeyList(ns, lang, String(active)));
+      await env.PROMPT_CACHE.delete(promptsKVKeyList(ns, lang, "*"));
+      await env.PROMPT_CACHE.delete(promptsKVKeyList(ns, "*", "*"));
+
+      logInfo({ request_id: rid, route: '/v1/prompts', method: 'POST', status: 201, id, namespace: ns, lang, make_default: !!body.make_default, latency_ms: nowMs() - started });
+      return new Response(JSON.stringify({ id }), { status: 201, headers: { "content-type": "application/json; charset=utf-8", ...corsHeadersFor(req, env) } });
+    }
+
+    // UPDATE
+    const mPut = url.pathname.match(/^\/v1\/prompts\/(\d+)$/);
+    if (req.method === "PUT" && mPut) {
+      if ((req.headers.get("X-Admin-Token") || "") !== (env.ADMIN_TOKEN || "")) {
+        return errorResponse(req, env, { code: "UNAUTHORIZED", message: "unauthorized", status: 401 });
+      }
+      const nonceCheck = await verifyNonce(req, env); if (nonceCheck) return nonceCheck;
+      const rl = await rateLimitWrite(req, env, 'prompts_update'); if (rl) return rl;
+      const id = Number(mPut[1]);
+      let body: any; try { body = await req.json(); } catch { body = {}; }
+
+      const cur = await env.vlm_api_db
+        .prepare(`SELECT prompt_namespace, prompt_lang, prompt_is_active FROM prompts WHERE prompt_id = ?`).bind(id).first();
+      if (!cur) return errorResponse(req, env, { code: "NOT_FOUND", message: "not found", status: 404 });
+
+      const fields: string[] = []; const args: any[] = [];
+      for (const [k, v] of Object.entries(body)) {
+        if (k === "tags") { fields.push(`prompt_tags = ?`); args.push(JSON.stringify(v)); }
+        else if (k === "namespace") { fields.push(`prompt_namespace = ?`); args.push(v); }
+        else if (k === "name") { fields.push(`prompt_name = ?`); args.push(v); }
+        else if (k === "version") { fields.push(`prompt_version = ?`); args.push(v); }
+        else if (k === "lang") { fields.push(`prompt_lang = ?`); args.push(v); }
+        else if (k === "text") { fields.push(`prompt_text = ?`); args.push(v); }
+        else if (k === "is_active") { fields.push(`prompt_is_active = ?`); args.push(v); }
+      }
+      if (!fields.length) return errorResponse(req, env, { code: "NO_UPDATES", message: "nothing to update", status: 400 });
+      fields.push(`prompt_updated_at = ?`); args.push(new Date().toISOString()); args.push(id);
+      await env.vlm_api_db.prepare(`UPDATE prompts SET ${fields.join(", ")} WHERE prompt_id = ?`).bind(...args).run();
+
+      await env.PROMPT_CACHE.delete(promptsKVKeyById(id));
+      await env.PROMPT_CACHE.delete(promptsKVKeyList(cur.prompt_namespace, cur.prompt_lang, String(cur.prompt_is_active)));
+      await env.PROMPT_CACHE.delete(promptsKVKeyList(cur.prompt_namespace, cur.prompt_lang, "*"));
+      logInfo({ request_id: rid, route: '/v1/prompts/:id', method: 'PUT', status: 200, id, latency_ms: nowMs() - started });
+      return jsonResponse(req, env, { updated: true }, 200);
+    }
+
+    // SET DEFAULT
+    const mDef = url.pathname.match(/^\/v1\/prompts\/(\d+)\/default$/);
+    if (req.method === "PUT" && mDef) {
+      if ((req.headers.get("X-Admin-Token") || "") !== (env.ADMIN_TOKEN || "")) {
+        return errorResponse(req, env, { code: "UNAUTHORIZED", message: "unauthorized", status: 401 });
+      }
+      const nonceCheck = await verifyNonce(req, env); if (nonceCheck) return nonceCheck;
+      const rl = await rateLimitWrite(req, env, 'prompts_set_default'); if (rl) return rl;
+      const id = Number(mDef[1]);
+      const row = await env.vlm_api_db
+        .prepare(`SELECT prompt_namespace, prompt_lang, prompt_is_active FROM prompts WHERE prompt_id = ?`).bind(id).first();
+      if (!row) return errorResponse(req, env, { code: "NOT_FOUND", message: "not found", status: 404 });
+      if (row.prompt_is_active !== 1) return errorResponse(req, env, { code: "BAD_STATE", message: "prompt must be active to set default", status: 400 });
+
+      await env.vlm_api_db.batch([
+        env.vlm_api_db.prepare(`UPDATE prompts SET prompt_is_default = 0 WHERE prompt_namespace = ? AND prompt_lang = ?`).bind(row.prompt_namespace, row.prompt_lang),
+        env.vlm_api_db.prepare(`UPDATE prompts SET prompt_is_default = 1 WHERE prompt_id = ?`).bind(id),
+      ]);
+      await env.PROMPT_CACHE.delete(promptsKVKeyDefault(row.prompt_namespace, row.prompt_lang));
+      await env.PROMPT_CACHE.delete(promptsKVKeyList(row.prompt_namespace, row.prompt_lang, "*"));
+      logInfo({ request_id: rid, route: '/v1/prompts/:id/default', method: 'PUT', status: 200, id, latency_ms: nowMs() - started });
+      return jsonResponse(req, env, { default_set: true }, 200);
+    }
+
+    logWarn({ request_id: rid, route: url.pathname, method: req.method, status: 404, latency_ms: nowMs() - started });
+    return errorResponse(req, env, { code: "NOT_FOUND", message: "Not Found", status: 404 }, rid);
   },
+  async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext) {
+    try {
+      if (!env.BACKUPS) return;
+      const key = await backupPromptsToR2(env);
+      // No direct logging channel here, but console.log works in workers
+      console.log(JSON.stringify({ level: 'info', ts: Date.now(), route: 'cron:backup', key }));
+    } catch (e: any) {
+      console.error(JSON.stringify({ level: 'error', ts: Date.now(), route: 'cron:backup', error: e?.message || String(e) }));
+    }
+  }
 };
+
+// Backup helper: dumps prompts table to R2 as JSON
+async function backupPromptsToR2(env: Env): Promise<string> {
+  const prefix = (env.BACKUP_PREFIX && env.BACKUP_PREFIX.trim()) || 'd1-backups/';
+  const ts = new Date().toISOString().replace(/[:.]/g, '-');
+  const key = `${prefix}prompts-${ts}.json`;
+  // Simple dump (could be chunked for huge tables)
+  const rs = await env.vlm_api_db.prepare('SELECT * FROM prompts ORDER BY prompt_namespace, prompt_name, prompt_version').all();
+  const rows = (rs.results || []) as any[];
+  const mapped = rows.map(mapPromptRow);
+  const body = JSON.stringify({ ts: new Date().toISOString(), count: mapped.length, items: mapped });
+  await env.BACKUPS!.put(key, body, { httpMetadata: { contentType: 'application/json; charset=utf-8' } });
+  return key;
+}
