@@ -10,55 +10,77 @@
 	"name": "vlmm-worker",
 	"main": "src/index.ts",
 	"compatibility_date": "2025-08-25",
+	"legacy_env": false,
 	"observability": {
 		"enabled": true
 	},
-	"vars": {
-		"ALLOWED_ORIGINS": "https://vlm-api-front.vercel.app,http://localhost:3000",
-		"DEFAULT_MODEL": "glm-4.5v",
-		"APP_URL": "vlm-api-front.vercel.app",
-		"APP_TITLE": "VLMM Proxy",
-		"ADMIN_TOKEN": "test-admin",
-		"ENABLE_SCHEMA_BOOTSTRAP": "1"
+	"triggers": {
+		"crons": [
+			"0 3 * * *"
+		]
 	},
-	"d1_databases": [
-		{
-			"binding": "vlm_api_db",
-			"database_name": "vlm-api-db",
-			"database_id": "97d1e5c4-8964-4261-8194-feae036c7d9a"
-		}
-	],
-	"kv_namespaces": [
-		{
-			"binding": "PROMPT_CACHE",
-			"id": "123aeee3ad654d898c74c6f55ceeb3cb"
-		}
-	],
-	"r2_buckets": [
-		{
-			"binding": "BACKUPS",
-			"bucket_name": "vlmm-worker-backups"
-		}
-	],
-		"triggers": {
-			"crons": ["0 3 * * *"]
-		},
-		"env": {
-			"stage": {
-				"vars": {
-					"ALLOWED_ORIGINS": "https://stage.your-app.com,http://localhost:3000",
-					"APP_TITLE": "VLMM Proxy (stage)",
-					"ENABLE_SCHEMA_BOOTSTRAP": "0"
-				}
+	"env": {
+		"stage": {
+			"vars": {
+				"ALLOWED_ORIGINS": "https://stage-vlm-api-front.vercel.app,http://localhost:3333",
+				"DEFAULT_MODEL": "glm-4.5v",
+				"APP_URL": "https://vlm-api-front.vercel.app",
+				"APP_TITLE": "VLMM Proxy (stage)",
+				"ENABLE_SCHEMA_BOOTSTRAP": "0",
+				"BACKUP_PREFIX": "stage/d1/vlm-api-db/",
+				"REQUIRE_READ_AUTH": "1"
 			},
-			"production": {
-				"vars": {
-					"ALLOWED_ORIGINS": "https://your-app.com",
-					"APP_TITLE": "VLMM Proxy",
-					"ENABLE_SCHEMA_BOOTSTRAP": "0"
+			"d1_databases": [
+				{
+					"binding": "vlm_api_db",
+					"database_name": "vlm-api-db",
+					"database_id": "97d1e5c4-8964-4261-8194-feae036c7d9a"
 				}
-			}
+			],
+			"kv_namespaces": [
+				{
+					"binding": "PROMPT_CACHE",
+					"id": "123aeee3ad654d898c74c6f55ceeb3cb"
+				}
+			],
+			"r2_buckets": [
+				{
+					"bucket_name": "vlmm-worker-backups",
+					"binding": "BACKUPS"
+				}
+			],
+		},
+		"production": {
+			"vars": {
+				"ALLOWED_ORIGINS": "https://vlm-api-front.vercel.app",
+				"DEFAULT_MODEL": "glm-4.5v",
+				"APP_URL": "https://vlm-api-front.vercel.app",
+				"APP_TITLE": "VLMM Proxy",
+				"ENABLE_SCHEMA_BOOTSTRAP": "0",
+				"BACKUP_PREFIX": "prod/d1/vlm-api-db/",
+				"REQUIRE_READ_AUTH": "1"
+			},
+			"d1_databases": [
+				{
+					"binding": "vlm_api_db",
+					"database_name": "vlm-api-db",
+					"database_id": "97d1e5c4-8964-4261-8194-feae036c7d9a"
+				}
+			],
+			"kv_namespaces": [
+				{
+					"binding": "PROMPT_CACHE",
+					"id": "123aeee3ad654d898c74c6f55ceeb3cb"
+				}
+			],
+			"r2_buckets": [
+				{
+					"bucket_name": "vlmm-worker-backups",
+					"binding": "BACKUPS"
+				}
+			],
 		}
+	}
 	/**
 	 * Smart Placement
 	 * Docs: https://developers.cloudflare.com/workers/configuration/smart-placement/#smart-placement
