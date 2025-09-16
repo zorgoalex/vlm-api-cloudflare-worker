@@ -9,7 +9,7 @@
 	"$schema": "node_modules/wrangler/config-schema.json",
 	"name": "vlmm-worker",
 	"main": "src/index.ts",
-	"compatibility_date": "2025-08-25",
+	"compatibility_date": "2025-08-16",
 	"legacy_env": false,
 	"observability": {
 		"enabled": true
@@ -19,6 +19,13 @@
 			"0 3 * * *"
 		]
 	},
+	"d1_databases": [
+	    {
+	      "binding": "vlm_api_db",
+	      "database_name": "vlm-api-db",
+	      "database_id": "00000000-0000-0000-0000-000000000000" // required even for --local
+	    }
+	],
 	"env": {
 		"stage": {
 			"vars": {

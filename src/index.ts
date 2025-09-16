@@ -134,6 +134,7 @@ const mapPromptRow = (r: any) => ({
   lang: r.prompt_lang,
   text: r.prompt_text,
   tags: (() => { try { return JSON.parse(r.prompt_tags || "[]"); } catch { return []; } })(),
+  priority: typeof r.prompt_priority === 'number' ? r.prompt_priority : 0,
   is_active: r.prompt_is_active,
   is_default: r.prompt_is_default,
   created_at: r.prompt_created_at,
@@ -154,6 +155,7 @@ async function ensurePromptsSchema(env: Env) {
       prompt_lang        TEXT NOT NULL DEFAULT 'ru',
       prompt_text        TEXT NOT NULL,
       prompt_tags        TEXT NOT NULL DEFAULT '[]',
+      prompt_priority    INTEGER NOT NULL DEFAULT 0,
       prompt_is_active   INTEGER NOT NULL DEFAULT 1,
       prompt_is_default  INTEGER NOT NULL DEFAULT 0,
       prompt_created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
@@ -176,6 +178,8 @@ async function ensurePromptsSchema(env: Env) {
   for (const sql of stmts) {
     await env.vlm_api_db.prepare(sql).run().catch(() => undefined);
   }
+  // Best-effort add new columns for forward-compat
+  await env.vlm_api_db.prepare(`ALTER TABLE prompts ADD COLUMN prompt_priority INTEGER NOT NULL DEFAULT 0`).run().catch(() => undefined);
   schemaReady = true;
 }
 
@@ -602,11 +606,28 @@ export default {
       const tag  = url.searchParams.get("tag") || undefined;
       const limit = Math.max(1, Math.min(100, Number(url.searchParams.get("limit") || 50)));
       const offset = Math.max(0, Number(url.searchParams.get("offset") || 0));
+      const sortParam = (url.searchParams.get("sort") || "priority_asc").toLowerCase();
 
-      const canCache = !q && !tag && offset === 0; // don't cache search or offset pages
+      // Detect presence of prompt_priority column (for forward/backward compat in tests/dev)
+      let hasPrioCol = true;
+      try {
+        const chk = await env.vlm_api_db
+          .prepare(`SELECT 1 FROM pragma_table_info('prompts') WHERE name = 'prompt_priority' LIMIT 1`)
+          .first();
+        hasPrioCol = !!chk;
+      } catch { hasPrioCol = false; }
+
+      // Whitelisted ORDER BY options
+      let orderBy = hasPrioCol ? "prompt_priority ASC, prompt_name, prompt_version DESC" : "prompt_name, prompt_version DESC";
+      if (sortParam === "priority_desc") orderBy = hasPrioCol ? "prompt_priority DESC, prompt_name, prompt_version DESC" : "prompt_name DESC, prompt_version DESC";
+      else if (sortParam === "name_asc") orderBy = "prompt_name ASC, prompt_version DESC";
+      else if (sortParam === "name_desc") orderBy = "prompt_name DESC, prompt_version DESC";
+      else if (sortParam === "updated_desc") orderBy = "prompt_updated_at DESC";
+
+      const canCache = !q && !tag && offset === 0 && sortParam === 'priority_asc' && hasPrioCol; // cache only default sort when prio exists
       const cacheKey = promptsKVKeyList(ns, lang, act);
       if (canCache) {
-        const cached = await env.PROMPT_CACHE.get(cacheKey, "json");
+        const cached = await env.PROMPT_CACHE?.get(cacheKey, "json");
         if (cached) {
           logInfo({ request_id: rid, route: '/v1/prompts', method: 'GET', cache: 'HIT', namespace: ns, lang, active: act, q: !!q, tag: !!tag, count: Array.isArray(cached) ? cached.length : undefined, latency_ms: nowMs() - started });
           return jsonResponse(req, env, cached, 200);
@@ -620,11 +641,11 @@ export default {
       if (tag) { where.push("EXISTS (SELECT 1 FROM json_each(prompts.prompt_tags) je WHERE je.value = ?)"); args.push(tag); }
 
       const sql = `SELECT * FROM prompts WHERE ${where.join(" AND ")}
-                   ORDER BY prompt_namespace, prompt_name, prompt_version DESC
+                   ORDER BY ${orderBy}
                    LIMIT ? OFFSET ?`;
       const rs = await env.vlm_api_db.prepare(sql).bind(...args, limit, offset).all();
       const out = rs.results?.map(mapPromptRow) ?? [];
-      if (canCache) await env.PROMPT_CACHE.put(cacheKey, JSON.stringify(out), { expirationTtl: 60 });
+      if (canCache && env.PROMPT_CACHE) await env.PROMPT_CACHE.put(cacheKey, JSON.stringify(out), { expirationTtl: 60 });
       logInfo({ request_id: rid, route: '/v1/prompts', method: 'GET', cache: canCache ? 'MISS' : 'BYPASS', namespace: ns, lang, active: act, q: !!q, tag: !!tag, count: out.length, latency_ms: nowMs() - started });
       return jsonResponse(req, env, out, 200);
     }
@@ -635,13 +656,13 @@ export default {
       const readAuth = verifyReadAuth(req, env); if (readAuth) return readAuth;
       const id = Number(mGet[1]);
       const k = promptsKVKeyById(id);
-      const cached = await env.PROMPT_CACHE.get(k, "json");
+      const cached = await env.PROMPT_CACHE?.get(k, "json");
       if (cached) { logInfo({ request_id: rid, route: '/v1/prompts/:id', method: 'GET', cache: 'HIT', id, latency_ms: nowMs() - started }); return jsonResponse(req, env, cached, 200); }
 
       const row = await env.vlm_api_db.prepare(`SELECT * FROM prompts WHERE prompt_id = ?`).bind(id).first();
       if (!row) return errorResponse(req, env, { code: "NOT_FOUND", message: "not found", status: 404 });
       const out = mapPromptRow(row);
-      await env.PROMPT_CACHE.put(k, JSON.stringify(out), { expirationTtl: 300 });
+      if (env.PROMPT_CACHE) await env.PROMPT_CACHE.put(k, JSON.stringify(out), { expirationTtl: 300 });
       logInfo({ request_id: rid, route: '/v1/prompts/:id', method: 'GET', cache: 'MISS', id, latency_ms: nowMs() - started });
       return jsonResponse(req, env, out, 200);
     }
@@ -652,7 +673,7 @@ export default {
       const ns   = url.searchParams.get("namespace") || "default";
       const lang = url.searchParams.get("lang") || "ru";
       const k = promptsKVKeyDefault(ns, lang);
-      const cached = await env.PROMPT_CACHE.get(k, "json");
+      const cached = await env.PROMPT_CACHE?.get(k, "json");
       if (cached) { logInfo({ request_id: rid, route: '/v1/prompts/default', method: 'GET', cache: 'HIT', namespace: ns, lang, latency_ms: nowMs() - started }); return jsonResponse(req, env, cached, 200); }
 
       const row = await env.vlm_api_db
@@ -660,7 +681,7 @@ export default {
         .bind(ns, lang).first();
       if (!row) return errorResponse(req, env, { code: "NOT_FOUND", message: "not found", status: 404 });
       const out = mapPromptRow(row);
-      await env.PROMPT_CACHE.put(k, JSON.stringify(out), { expirationTtl: 300 });
+      if (env.PROMPT_CACHE) await env.PROMPT_CACHE.put(k, JSON.stringify(out), { expirationTtl: 300 });
       logInfo({ request_id: rid, route: '/v1/prompts/default', method: 'GET', cache: 'MISS', namespace: ns, lang, latency_ms: nowMs() - started });
       return jsonResponse(req, env, out, 200);
     }
@@ -708,17 +729,21 @@ export default {
       `).bind(ns, body.name, ver, lang, body.text, tags, active, ts, ts).run();
 
       const id = Number((res as any)?.meta?.last_row_id ?? (res as any)?.lastRowId ?? 0);
+      // Optional initial priority set (compatible with pre-migration DBs)
+      if (typeof body.priority === 'number' && Number.isFinite(body.priority)) {
+        await env.vlm_api_db.prepare(`UPDATE prompts SET prompt_priority = ? WHERE prompt_id = ?`).bind(body.priority, id).run().catch(() => undefined);
+      }
       if (body.make_default) {
         await env.vlm_api_db.batch([
           env.vlm_api_db.prepare(`UPDATE prompts SET prompt_is_default = 0 WHERE prompt_namespace = ? AND prompt_lang = ?`).bind(ns, lang),
           env.vlm_api_db.prepare(`UPDATE prompts SET prompt_is_default = 1 WHERE prompt_id = ?`).bind(id),
         ]);
-        await env.PROMPT_CACHE.delete(promptsKVKeyDefault(ns, lang));
+        await env.PROMPT_CACHE?.delete(promptsKVKeyDefault(ns, lang));
       }
 
-      await env.PROMPT_CACHE.delete(promptsKVKeyList(ns, lang, String(active)));
-      await env.PROMPT_CACHE.delete(promptsKVKeyList(ns, lang, "*"));
-      await env.PROMPT_CACHE.delete(promptsKVKeyList(ns, "*", "*"));
+      await env.PROMPT_CACHE?.delete(promptsKVKeyList(ns, lang, String(active)));
+      await env.PROMPT_CACHE?.delete(promptsKVKeyList(ns, lang, "*"));
+      await env.PROMPT_CACHE?.delete(promptsKVKeyList(ns, "*", "*"));
 
       logInfo({ request_id: rid, route: '/v1/prompts', method: 'POST', status: 201, id, namespace: ns, lang, make_default: !!body.make_default, latency_ms: nowMs() - started });
       return new Response(JSON.stringify({ id }), { status: 201, headers: { "content-type": "application/json; charset=utf-8", ...corsHeadersFor(req, env) } });
@@ -747,15 +772,16 @@ export default {
         else if (k === "version") { fields.push(`prompt_version = ?`); args.push(v); }
         else if (k === "lang") { fields.push(`prompt_lang = ?`); args.push(v); }
         else if (k === "text") { fields.push(`prompt_text = ?`); args.push(v); }
+        else if (k === "priority") { fields.push(`prompt_priority = ?`); args.push(v); }
         else if (k === "is_active") { fields.push(`prompt_is_active = ?`); args.push(v); }
       }
       if (!fields.length) return errorResponse(req, env, { code: "NO_UPDATES", message: "nothing to update", status: 400 });
       fields.push(`prompt_updated_at = ?`); args.push(new Date().toISOString()); args.push(id);
       await env.vlm_api_db.prepare(`UPDATE prompts SET ${fields.join(", ")} WHERE prompt_id = ?`).bind(...args).run();
 
-      await env.PROMPT_CACHE.delete(promptsKVKeyById(id));
-      await env.PROMPT_CACHE.delete(promptsKVKeyList(cur.prompt_namespace, cur.prompt_lang, String(cur.prompt_is_active)));
-      await env.PROMPT_CACHE.delete(promptsKVKeyList(cur.prompt_namespace, cur.prompt_lang, "*"));
+      await env.PROMPT_CACHE?.delete(promptsKVKeyById(id));
+      await env.PROMPT_CACHE?.delete(promptsKVKeyList(cur.prompt_namespace, cur.prompt_lang, String(cur.prompt_is_active)));
+      await env.PROMPT_CACHE?.delete(promptsKVKeyList(cur.prompt_namespace, cur.prompt_lang, "*"));
       logInfo({ request_id: rid, route: '/v1/prompts/:id', method: 'PUT', status: 200, id, latency_ms: nowMs() - started });
       return jsonResponse(req, env, { updated: true }, 200);
     }
@@ -778,8 +804,8 @@ export default {
         env.vlm_api_db.prepare(`UPDATE prompts SET prompt_is_default = 0 WHERE prompt_namespace = ? AND prompt_lang = ?`).bind(row.prompt_namespace, row.prompt_lang),
         env.vlm_api_db.prepare(`UPDATE prompts SET prompt_is_default = 1 WHERE prompt_id = ?`).bind(id),
       ]);
-      await env.PROMPT_CACHE.delete(promptsKVKeyDefault(row.prompt_namespace, row.prompt_lang));
-      await env.PROMPT_CACHE.delete(promptsKVKeyList(row.prompt_namespace, row.prompt_lang, "*"));
+      await env.PROMPT_CACHE?.delete(promptsKVKeyDefault(row.prompt_namespace, row.prompt_lang));
+      await env.PROMPT_CACHE?.delete(promptsKVKeyList(row.prompt_namespace, row.prompt_lang, "*"));
       logInfo({ request_id: rid, route: '/v1/prompts/:id/default', method: 'PUT', status: 200, id, latency_ms: nowMs() - started });
       return jsonResponse(req, env, { default_set: true }, 200);
     }

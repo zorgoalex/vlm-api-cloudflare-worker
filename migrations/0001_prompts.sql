@@ -6,6 +6,7 @@ CREATE TABLE IF NOT EXISTS prompts (
   prompt_lang        TEXT NOT NULL DEFAULT 'ru',
   prompt_text        TEXT NOT NULL,
   prompt_tags        TEXT NOT NULL DEFAULT '[]',
+  prompt_priority    INTEGER NOT NULL DEFAULT 0,
   prompt_is_active   INTEGER NOT NULL DEFAULT 1,
   prompt_is_default  INTEGER NOT NULL DEFAULT 0,
   prompt_created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),

@@ -82,4 +82,75 @@ describe('Prompts API (D1 + KV)', () => {
     item = await res.json();
     expect(item.name).toBe('order_parser_ru_v2');
   });
+
+  it('priority and sort options', async () => {
+    // create three items with different priorities and names
+    let ctx = createExecutionContext();
+    let req = new IncomingRequest(`${base}/v1/prompts`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'X-Admin-Token': admin },
+      body: JSON.stringify({ namespace: 'sort', name: 'b_second', version: 1, lang: 'ru', text: 'B', priority: 5, is_active: 1 }),
+    });
+    let res = await worker.fetch(req, env, ctx); await waitOnExecutionContext(ctx); expect(res.status).toBe(201);
+    const idB = (await res.json() as any).id;
+
+    ctx = createExecutionContext();
+    req = new IncomingRequest(`${base}/v1/prompts`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'X-Admin-Token': admin },
+      body: JSON.stringify({ namespace: 'sort', name: 'a_first', version: 1, lang: 'ru', text: 'A', priority: -1, is_active: 1 }),
+    });
+    res = await worker.fetch(req, env, ctx); await waitOnExecutionContext(ctx); expect(res.status).toBe(201);
+    const idA = (await res.json() as any).id;
+
+    ctx = createExecutionContext();
+    req = new IncomingRequest(`${base}/v1/prompts`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'X-Admin-Token': admin },
+      body: JSON.stringify({ namespace: 'sort', name: 'c_third', version: 1, lang: 'ru', text: 'C', priority: 10, is_active: 1 }),
+    });
+    res = await worker.fetch(req, env, ctx); await waitOnExecutionContext(ctx); expect(res.status).toBe(201);
+    const idC = (await res.json() as any).id;
+
+    // default sort: priority ASC, then name
+    ctx = createExecutionContext();
+    req = new IncomingRequest(`${base}/v1/prompts?namespace=sort&lang=ru&active=1`);
+    res = await worker.fetch(req, env, ctx); await waitOnExecutionContext(ctx); expect(res.status).toBe(200);
+    let list = await res.json();
+    const namesDefault = list.map((p: any) => p.name);
+    expect(namesDefault).toEqual(['a_first','b_second','c_third']);
+
+    // sort=priority_desc
+    ctx = createExecutionContext();
+    req = new IncomingRequest(`${base}/v1/prompts?namespace=sort&lang=ru&active=1&sort=priority_desc`);
+    res = await worker.fetch(req, env, ctx); await waitOnExecutionContext(ctx); expect(res.status).toBe(200);
+    list = await res.json();
+    const namesPrioDesc = list.map((p: any) => p.name);
+    expect(namesPrioDesc).toEqual(['c_third','b_second','a_first']);
+
+    // sort=name_desc
+    ctx = createExecutionContext();
+    req = new IncomingRequest(`${base}/v1/prompts?namespace=sort&lang=ru&active=1&sort=name_desc`);
+    res = await worker.fetch(req, env, ctx); await waitOnExecutionContext(ctx); expect(res.status).toBe(200);
+    list = await res.json();
+    const namesNameDesc = list.map((p: any) => p.name);
+    expect(namesNameDesc).toEqual(['c_third','b_second','a_first']);
+
+    // Update one item to test updated_desc order
+    ctx = createExecutionContext();
+    req = new IncomingRequest(`${base}/v1/prompts/${idB}`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json', 'X-Admin-Token': admin },
+      body: JSON.stringify({ text: 'B updated' }),
+    });
+    res = await worker.fetch(req, env, ctx); await waitOnExecutionContext(ctx); expect(res.status).toBe(200);
+
+    // sort=updated_desc should place b_second first
+    ctx = createExecutionContext();
+    req = new IncomingRequest(`${base}/v1/prompts?namespace=sort&lang=ru&active=1&sort=updated_desc`);
+    res = await worker.fetch(req, env, ctx); await waitOnExecutionContext(ctx); expect(res.status).toBe(200);
+    list = await res.json();
+    const firstUpdated = list[0];
+    expect(firstUpdated.name).toBe('b_second');
+  });
 });

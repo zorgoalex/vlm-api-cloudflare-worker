@@ -1,7 +1,7 @@
 export const OPENAPI_YAML = `openapi: 3.0.3
 info:
   title: VLMM Worker API
-  version: 1.0.0
+  version: 1.1.0
   description: >-
     Cloudflare Worker for Vision and Prompts management.
 servers:
@@ -27,6 +27,13 @@ paths:
         - in: query
           name: tag
           schema: { type: string }
+        - in: query
+          name: sort
+          schema:
+            type: string
+            enum: ["priority_asc", "priority_desc", "name_asc", "name_desc", "updated_desc"]
+            default: "priority_asc"
+          description: Sorting mode; default is priority_asc (lower number means higher priority)
         - in: query
           name: limit
           schema: { type: integer, minimum: 1, maximum: 100, default: 50 }
@@ -153,6 +160,7 @@ components:
         version: { type: integer }
         lang: { type: string }
         text: { type: string }
+        priority: { type: integer, default: 0, description: "Lower is higher priority" }
         tags:
           type: array
           items: { type: string }
@@ -169,6 +177,7 @@ components:
         version: { type: integer, default: 1 }
         lang: { type: string, default: "ru" }
         text: { type: string }
+        priority: { type: integer, default: 0, description: "Lower is higher priority" }
         tags:
           type: array
           items: { type: string }
@@ -182,6 +191,7 @@ components:
         version: { type: integer }
         lang: { type: string }
         text: { type: string }
+        priority: { type: integer, description: "Lower is higher priority" }
         tags:
           type: array
           items: { type: string }
@@ -209,4 +219,3 @@ components:
         application/json:
           schema: { $ref: '#/components/schemas/Error' }
 `;
-
