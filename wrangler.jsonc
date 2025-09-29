@@ -35,7 +35,8 @@
 				"APP_TITLE": "VLMM Proxy (stage)",
 				"ENABLE_SCHEMA_BOOTSTRAP": "0",
 				"BACKUP_PREFIX": "stage/d1/vlm-api-db/",
-				"REQUIRE_READ_AUTH": "1"
+				"REQUIRE_READ_AUTH": "1",
+				"ENABLE_REGEX_CONFIG": "1"
 			},
 			"d1_databases": [
 				{
@@ -48,6 +49,10 @@
 				{
 					"binding": "PROMPT_CACHE",
 					"id": "123aeee3ad654d898c74c6f55ceeb3cb"
+				},
+				{
+					"binding": "VLM_CONFIG",
+					"id": "00000000000000000000000000000000"
 				}
 			],
 			"r2_buckets": [
@@ -65,7 +70,9 @@
 				"APP_TITLE": "VLMM Proxy",
 				"ENABLE_SCHEMA_BOOTSTRAP": "0",
 				"BACKUP_PREFIX": "prod/d1/vlm-api-db/",
-				"REQUIRE_READ_AUTH": "1"
+				"REQUIRE_READ_AUTH": "1",
+				"ENABLE_REGEX_CONFIG": "1"
+
 			},
 			"d1_databases": [
 				{
@@ -78,6 +85,10 @@
 				{
 					"binding": "PROMPT_CACHE",
 					"id": "123aeee3ad654d898c74c6f55ceeb3cb"
+				},
+				{
+					"binding": "VLM_CONFIG",
+					"id": "3492de5f9eb543aa96aca968e6c77156"
 				}
 			],
 			"r2_buckets": [

@@ -48,6 +48,12 @@ export interface Env {
   // R2 backups
   BACKUPS?: R2Bucket;                    // R2 bucket binding for backups
   BACKUP_PREFIX?: string;                // e.g. 'd1-backups/'
+
+  // Regex cleanup config (tiny tweak)
+  VLM_CONFIG?: KVNamespace;              // optional KV for config
+  ENABLE_REGEX_CONFIG?: string;          // '1' to expose config via /about
+  REGEX_CLEANUP_PATTERN?: string;        // optional secret/env fallback
+  REGEX_CLEANUP_FLAGS?: string;          // optional secret/env fallback
 }
 
 // ---------------------------------------------------------------------------
@@ -116,6 +122,61 @@ function logWarn(fields: Record<string, unknown>) {
 }
 function logError(fields: Record<string, unknown>) {
   try { console.error(JSON.stringify({ level: 'error', ts: Date.now(), ...fields })); } catch { /* noop */ }
+}
+
+// ---------------------------------------------------------------------------
+// Regex cleanup config helpers (KV -> Secrets -> Default) with in‑memory cache
+// ---------------------------------------------------------------------------
+
+type RegexConfig = { pattern: string; flags: string; source: 'kv' | 'secret' | 'default'; updated_at: string };
+const REGEX_KV_PATTERN_KEY = 'vision:regex:pattern';
+const REGEX_KV_FLAGS_KEY = 'vision:regex:flags';
+let regexConfigCache: { value: RegexConfig; exp: number } | null = null;
+
+async function readRegexConfig(env: Env, ttlSec = 180): Promise<RegexConfig> {
+  const now = Date.now();
+  if (regexConfigCache && regexConfigCache.exp > now) return regexConfigCache.value;
+
+  let pattern: string | null = null;
+  let flags: string | null = null;
+  let source: 'kv' | 'secret' | 'default' = 'default';
+
+  try {
+    if (env.VLM_CONFIG) {
+      const [p, f] = await Promise.all([
+        env.VLM_CONFIG.get(REGEX_KV_PATTERN_KEY),
+        env.VLM_CONFIG.get(REGEX_KV_FLAGS_KEY),
+      ]);
+      if (p || f) {
+        pattern = p ?? null;
+        flags = f ?? null;
+        source = 'kv';
+      }
+    }
+  } catch { /* ignore KV read errors */ }
+
+  if (source === 'default') {
+    if (env.REGEX_CLEANUP_PATTERN || env.REGEX_CLEANUP_FLAGS) {
+      pattern = env.REGEX_CLEANUP_PATTERN ?? pattern;
+      flags = env.REGEX_CLEANUP_FLAGS ?? flags;
+      source = 'secret';
+    }
+  } else {
+    // If KV provided only one of values, try to fill from secrets
+    if (!pattern && env.REGEX_CLEANUP_PATTERN) pattern = env.REGEX_CLEANUP_PATTERN;
+    if (!flags && env.REGEX_CLEANUP_FLAGS) flags = env.REGEX_CLEANUP_FLAGS;
+  }
+
+  if (!pattern) pattern = "^(?:System|Meta|Debug|SSE|Event|Disclaimer)\\s*:.*$";
+  if (!flags) flags = "gmi";
+  if (source === 'default' && (env.REGEX_CLEANUP_PATTERN || env.REGEX_CLEANUP_FLAGS)) source = 'secret';
+
+  // Validate quietly
+  try { /* eslint-disable no-new */ new RegExp(pattern, flags); } catch { /* return as-is */ }
+
+  const value: RegexConfig = { pattern, flags, source, updated_at: new Date().toISOString() };
+  regexConfigCache = { value, exp: now + Math.max(60, ttlSec) * 1000 };
+  return value;
 }
 
 // ---------------------------------------------------------------------------
@@ -520,7 +581,7 @@ export default {
         nonce_required_for_write: env.ENABLE_NONCE_REQUIRED_FOR_WRITE === '1',
         schema_bootstrap: env.ENABLE_SCHEMA_BOOTSTRAP === '1',
       };
-      const out = {
+      const out: any = {
         name: 'vlmm-worker',
         version: env.APP_TITLE ? `${env.APP_TITLE}` : 'dev',
         app_version: (env as any).APP_VERSION || undefined,
@@ -529,6 +590,15 @@ export default {
         routes: ['/v1/vision/analyze', '/v1/vision/stream', '/v1/prompts', '/v1/prompts/{id}', '/v1/prompts/default', '/healthz'],
         flags,
       };
+      if (env.ENABLE_REGEX_CONFIG === '1') {
+        try {
+          const regex_cleanup = await readRegexConfig(env);
+          out.config = { ...(out.config || {}), regex_cleanup };
+          logInfo({ route: '/about', regex_config_source: regex_cleanup.source });
+        } catch (e: any) {
+          logWarn({ route: '/about', regex_config_error: String(e?.message || e) });
+        }
+      }
       const resp = jsonResponse(req, env, out, 200);
       logInfo({ request_id: rid, route: '/about', method: 'GET', status: 200, latency_ms: nowMs() - started });
       return resp;
